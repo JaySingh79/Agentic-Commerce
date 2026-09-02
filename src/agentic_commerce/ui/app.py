@@ -38,90 +38,105 @@ Try one of the example prompts below or type your instruction.
 
 
 def create_chat_app(chat_engine: ChatEngine | None = None) -> gr.Blocks:
-    """Builds and returns the Gradio Blocks app with chat + product gallery."""
+    """Builds and returns the Gradio Blocks app with ChatInterface + product gallery.
+
+    ChatInterface is kept for correct chat UX:
+    - user bubbles are shown immediately
+    - textbox clears after submit
+    - each assistant turn is a separate bubble (no mixing)
+    Gallery syncs from session state via chatbot.change (no double LLM).
+    """
     if chat_engine is None:
         chat_engine = ChatEngine()
 
-    def build_history_for_chatbot(
-        history: list[dict[str, str]], pending_answer: str
-    ) -> list[dict[str, str]]:
-        """Converts messages history + pending assistant markdown into Gradio messages."""
-        out = list(history) if history else []
-        if pending_answer:
-            out.append({"role": "assistant", "content": pending_answer})
-        return out
-
-    def stream_chat_with_gallery(
+    def respond(
         message: str,
         history: list[dict[str, str]],
         model_name: str,
         temperature: float,
         system_prompt: str,
         request: gr.Request,
-    ) -> Generator[tuple[list[dict[str, str]], list[tuple[str, str]]], None, None]:
+    ) -> Generator[str, None, None]:
         session_id = getattr(request, "session_hash", None) or "default_user_session"
-        # Normalize history from Gradio messages format
-        norm_history = history if isinstance(history, list) else []
-        # Stream dual output
-        final_gallery: list[tuple[str, str]] = []
-        pending = ""
-        for chat_md, gal in chat_engine.stream_with_gallery(
+        yield from chat_engine.stream_response(
             message=message,
-            history=norm_history,
+            history=history,
             system_prompt=system_prompt,
             temperature=temperature,
             model_name=model_name,
             session_id=session_id,
-        ):
-            pending = chat_md
-            final_gallery = gal
-            yield build_history_for_chatbot(norm_history, pending), final_gallery
-        # Ensure final frame
-        if not pending:
-            yield build_history_for_chatbot(norm_history, pending), final_gallery
+        )
+
+    # Gallery sync helper - reads session state written by agent tools
+    def refresh_gallery(
+        _chat_hist=None, request: gr.Request | None = None
+    ) -> list[tuple[str, str]]:
+        from agentic_commerce.backend.session import get_or_create_session
+        from agentic_commerce.ui.chat_engine import get_gallery_items
+
+        # Gradio injects request as keyword; _chat_hist is chatbot value when inputs=[chatbot]
+        session_id = getattr(request, "session_hash", None) if request else None
+        session_id = session_id or "default_user_session"
+        session = get_or_create_session(session_id)
+        return get_gallery_items(session)
+
+    def clear_gallery_fn():
+        return []
+
+    chatbot = gr.Chatbot(
+        height=620,
+        show_label=False,
+        placeholder=PLACEHOLDER_MD,
+    )
+
+    textbox = gr.Textbox(
+        placeholder="Message Agentic Commerce (e.g., 'Find running shoes', 'AP2 mandate')...",  # noqa: E501
+        container=False,
+        scale=7,
+        autofocus=True,
+    )
+
+    additional_inputs = [
+        gr.Dropdown(
+            choices=MODEL_CHOICES,
+            value=MODEL_CHOICES[0],
+            label="Active Model",
+        ),
+        gr.Slider(
+            minimum=0.0,
+            maximum=1.0,
+            value=0.4,
+            step=0.05,
+            label="Temperature",
+        ),
+        gr.Textbox(
+            value=DEFAULT_SYSTEM_PROMPT,
+            label="System Directives",
+            lines=6,
+            max_lines=16,
+        ),
+    ]
 
     with gr.Blocks(title="Agentic Commerce Hub", fill_height=True) as demo:
         gr.Markdown(
             "# 🛍️ Agentic Commerce Hub\n*Autonomous AI Agent Stack (Layer 1 MCP • Layer 2 A2A • Layer 3 AP2)*"  # noqa: E501
         )
-        gr.Markdown("Autonomous AI Agent Stack (Layer 1 MCP • Layer 2 A2A • Layer 3 AP2)")
         with gr.Row():
             with gr.Column(scale=7):
-                chatbot = gr.Chatbot(
-                    height=620,
-                    show_label=False,
-                    placeholder=PLACEHOLDER_MD,
+                # ChatInterface handles user/message bubbles correctly
+                gr.ChatInterface(
+                    fn=respond,
+                    chatbot=chatbot,
+                    textbox=textbox,
+                    title="Agentic Commerce Hub",
+                    description="Autonomous AI Agent Stack (Layer 1 MCP • Layer 2 A2A • Layer 3 AP2)",  # noqa: E501
+                    examples=EXAMPLES,
+                    additional_inputs=additional_inputs,
+                    additional_inputs_accordion=gr.Accordion(
+                        label="⚙️ Agent & Generation Parameters",
+                        open=False,
+                    ),
                 )
-                with gr.Row():
-                    textbox = gr.Textbox(
-                        placeholder="Message Agentic Commerce (e.g., 'Find running shoes', "  # noqa: E501
-                        "'AP2 mandate')...",
-                        container=False,
-                        scale=7,
-                        autofocus=True,
-                        show_label=False,
-                    )
-                    send_btn = gr.Button("Send", variant="primary", scale=1)
-                gr.Examples(examples=EXAMPLES, inputs=[textbox], label="Try examples")
-                with gr.Accordion(label="⚙️ Agent & Generation Parameters", open=False):
-                    model_dd = gr.Dropdown(
-                        choices=MODEL_CHOICES,
-                        value=MODEL_CHOICES[0],
-                        label="Active Model",
-                    )
-                    temp_sl = gr.Slider(
-                        minimum=0.0,
-                        maximum=1.0,
-                        value=0.4,
-                        step=0.05,
-                        label="Temperature",
-                    )
-                    sys_tb = gr.Textbox(
-                        value=DEFAULT_SYSTEM_PROMPT,
-                        label="System Directives",
-                        lines=6,
-                        max_lines=16,
-                    )
             with gr.Column(scale=3, min_width=280):
                 gr.Markdown("### 🖼️ Product Gallery")
                 gr.Markdown(  # noqa: E501
@@ -144,27 +159,12 @@ def create_chat_app(chat_engine: ChatEngine | None = None) -> gr.Blocks:
                     elem_classes=["gallery-help"],
                 )
                 clear_btn = gr.Button("Clear Gallery", variant="secondary")
+                clear_btn.click(fn=clear_gallery_fn, outputs=[gallery])
 
-        # Wire chat submit -> updates both chatbot and gallery
-        textbox.submit(
-            fn=stream_chat_with_gallery,
-            inputs=[textbox, chatbot, model_dd, temp_sl, sys_tb],
-            outputs=[chatbot, gallery],
+        # Sync gallery whenever chatbot updates (after each stream chunk) - no double LLM
+        chatbot.change(
+            fn=refresh_gallery, inputs=[chatbot], outputs=[gallery], show_progress=False
         )
-        send_btn.click(
-            fn=stream_chat_with_gallery,
-            inputs=[textbox, chatbot, model_dd, temp_sl, sys_tb],
-            outputs=[chatbot, gallery],
-        )
-
-        def clear_gallery_fn():
-            return []
-
-        clear_btn.click(fn=clear_gallery_fn, outputs=[gallery])
-
-        # Legacy compatibility: helper for tests that call respond directly  # noqa: E501
-        # (not mounted — just ensures stream_response still works if imported)
-        _ = chat_engine  # suppress unused
 
     return demo
 

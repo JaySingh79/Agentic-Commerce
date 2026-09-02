@@ -15,7 +15,13 @@ def test_chat_engine_empty_input():
 
 
 def test_chat_engine_multi_turn_flow():
+    from agentic_commerce.backend.session import _SESSION_STORE
+
+    # Isolate from polluting global session (previous tests leave last_searched_products)
+    _SESSION_STORE.clear()
     engine = ChatEngine()
+    # Force deterministic heuristic fallback (avoid live LLM tool-choice nondeterminism)
+    engine._agents.clear()
     history = []
 
     # Turn 1: Search
