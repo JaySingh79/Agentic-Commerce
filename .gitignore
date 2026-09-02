@@ -1,0 +1,67 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+.eggs/
+coverage/
+htmlcov/
+.coverage
+.coverage.*
+.hypothesis/
+*.log
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Node
+node_modules/
+.next/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+bun.lock
+pnpm-lock.yaml
+
+# Env & secrets
+.env
+.env.*
+!.env.example
+
+# IDE & OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Project specific ignores (watcher + tool caches)
+.agents/
+.claude/
+.firecrawl/
+.opencode/
+.serena/
+.playwright-mcp/
+skills/
+agents/
+
+# Keep watcher parity
+coverage/

@@ -1,0 +1,104 @@
+[
+  {
+    "type": "human",
+    "data": {
+      "content": "what is the weather today bro of New York",
+      "additional_kwargs": {},
+      "response_metadata": {},
+      "type": "human",
+      "name": null,
+      "id": "a5fdf10d-309f-449c-a3cb-13d541c89b02"
+    }
+  },
+  {
+    "type": "ai",
+    "data": {
+      "content": [],
+      "additional_kwargs": {
+        "function_call": {
+          "name": "weather_function",
+          "arguments": "{\"desired_location\": \"New York\"}"
+        },
+        "__gemini_function_call_thought_signatures__": {
+          "call_2806915": "EnEKbwERTTIPG2rdnP8VSUCos8VVX4QdT+dIaQ/g4yQ4e/QxosnkFG0VnQMgyKv0orpit+P25oy9y9kDhUOvK++Ct8VxM+tI/gxlB4wP/AkxIhkkWfzDDUFVZKiUeaN4tK9ta5BMB3uk4Pn1tWfeThREsg=="
+        }
+      },
+      "response_metadata": {
+        "finish_reason": "STOP",
+        "model_name": "gemini-3.1-flash-lite",
+        "safety_ratings": [],
+        "model_provider": "google_genai"
+      },
+      "type": "ai",
+      "name": null,
+      "id": "lc_run--01a043d5-3059-7152-81fd-170260bce6ea-0",
+      "tool_calls": [
+        {
+          "name": "weather_function",
+          "args": {
+            "desired_location": "New York"
+          },
+          "id": "call_2806915",
+          "type": "tool_call"
+        }
+      ],
+      "invalid_tool_calls": [],
+      "usage_metadata": {
+        "input_tokens": 96,
+        "output_tokens": 19,
+        "total_tokens": 115,
+        "input_token_details": {
+          "cache_read": 0
+        }
+      }
+    }
+  },
+  {
+    "type": "tool",
+    "data": {
+      "content": "{\"last_updated_epoch\": 1787843700, \"last_updated\": \"2026-08-27 11:15\", \"temp_c\": 27.3, \"temp_f\": 81.1, \"is_day\": 1, \"condition\": {\"text\": \"Overcast\", \"icon\": \"//cdn.weatherapi.com/weather/64x64/day/122.png\", \"code\": 1009}, \"wind_mph\": 10.7, \"wind_kph\": 17.3, \"wind_degree\": 173, \"wind_dir\": \"S\", \"pressure_mb\": 1017.0, \"pressure_in\": 30.03, \"precip_mm\": 0.0, \"precip_in\": 0.0, \"humidity\": 74, \"cloud\": 98, \"feelslike_c\": 29.8, \"feelslike_f\": 85.6, \"windchill_c\": 27.3, \"windchill_f\": 81.1, \"heatindex_c\": 30.1, \"heatindex_f\": 86.2, \"dewpoint_c\": 22.2, \"dewpoint_f\": 72.0, \"vis_km\": 10.0, \"vis_miles\": 6.0, \"uv\": 5.1, \"gust_mph\": 14.6, \"gust_kph\": 23.5, \"will_it_rain\": 0, \"chance_of_rain\": 19, \"will_it_snow\": 0, \"chance_of_snow\": 0, \"wetbulb_c\": 23.7, \"wetbulb_f\": 74.6}",
+      "additional_kwargs": {},
+      "response_metadata": {},
+      "type": "tool",
+      "name": "weather_function",
+      "id": "6056b887-576b-4608-8b83-eec7ad50eb65",
+      "tool_call_id": "call_2806915",
+      "artifact": null,
+      "status": "success"
+    }
+  },
+  {
+    "type": "ai",
+    "data": {
+      "content": [
+        {
+          "type": "text",
+          "text": "It's currently overcast in New York with a temperature of 81°F (27°C). It feels a bit warmer, around 86°F, due to the humidity.",
+          "extras": {
+            "signature": "EnEKbwERTTIPCKc6EgLdJcGoCJD9PLVYAJUWPl9uWb970eZv10UdiE0CTvPJrOr0DAngFevo1Ou1sLV8y0hlVL4pPyJLs7UNANzYur3DSrB+wfrSaYiMuMVCYutKmP+xR1Y37ock5jMnb/nYDPBcq7Gi2g=="
+          }
+        }
+      ],
+      "additional_kwargs": {},
+      "response_metadata": {
+        "finish_reason": "STOP",
+        "model_name": "gemini-3.1-flash-lite",
+        "safety_ratings": [],
+        "model_provider": "google_genai"
+      },
+      "type": "ai",
+      "name": null,
+      "id": "lc_run--01a043d5-3eae-7b83-89e1-25e679933c84-0",
+      "tool_calls": [],
+      "invalid_tool_calls": [],
+      "usage_metadata": {
+        "input_tokens": 478,
+        "output_tokens": 41,
+        "total_tokens": 519,
+        "input_token_details": {
+          "cache_read": 0
+        }
+      }
+    }
+  }
+]

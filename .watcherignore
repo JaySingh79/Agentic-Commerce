@@ -1,0 +1,17 @@
+node_modules/**
+.venv/**
+venv/**
+env/**
+__pycache__/**
+dist/**
+build/**
+.next/**
+coverage/**
+.agents/**
+.claude/**
+.firecrawl/**
+.opencode/**
+.serena/**
+.vscode/**
+.pytest_cache/**
+.ruff_cache/**
