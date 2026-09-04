@@ -2,6 +2,7 @@
 
 import gradio as gr
 
+from agentic_commerce.backend.agent import CommerceAgent
 from agentic_commerce.backend.session import get_or_create_session
 from agentic_commerce.ui.app import create_chat_app
 from agentic_commerce.ui.chat_engine import ChatEngine, _product_card, _search_cards
@@ -20,8 +21,13 @@ def test_chat_engine_multi_turn_flow():
     # Isolate from polluting global session (previous tests leave last_searched_products)
     _SESSION_STORE.clear()
     engine = ChatEngine()
-    # Force deterministic heuristic fallback (avoid live LLM tool-choice nondeterminism)
+    # Force the deterministic heuristic fallback: clearing the cache alone still
+    # rebuilds a live-LLM agent, which made tool choice (and this test) flaky.
+    # Pre-seeding an agent with llm=None pins the fallback dispatcher instead.
     engine._agents.clear()
+    agent = CommerceAgent(session_id="default_user_session")
+    agent.llm = None
+    engine._agents["default_user_session"] = agent
     history = []
 
     # Turn 1: Search
@@ -87,3 +93,63 @@ def test_product_card_uses_active_product():
     md = _product_card(session)
     assert "](https://cdn.shopify.com/p/detail.jpg)" in md
     assert "Detailed Shoe" in md
+
+
+def test_stream_with_gallery_flow():
+    from agentic_commerce.backend.session import _SESSION_STORE
+
+    _SESSION_STORE.clear()
+    engine = ChatEngine()
+    engine._agents.clear()
+
+    # Stream query
+    frames = list(
+        engine.stream_with_gallery(
+            message="Search for running shoes",
+            history=[],
+            session_id="test_gal_session",
+        )
+    )
+    assert len(frames) > 0
+    # Every frame is (chat_markdown, gallery_items, results_html)
+    text, gallery, results_html = frames[-1]
+    assert isinstance(text, str)
+    assert isinstance(gallery, list)
+    assert isinstance(results_html, str)
+    # Final frame contains response and images in gallery
+    assert len(gallery) > 0
+    # Product imagery renders as a grid panel, not stacked Markdown in the bubble
+    assert 'class="ac-grid"' in results_html
+    assert "![" not in text, "chat bubble must no longer stack Markdown images"
+    assert "running shoes" in text.lower() or "shoes" in text.lower()
+
+
+def test_session_clear_search_results():
+    session = get_or_create_session("test_clear_session")
+    session.update_search_results([{"id": "gid://1", "title": "Sneaker"}])
+    assert len(session.last_searched_products) == 1
+
+    session.clear_search_results()
+    assert len(session.last_searched_products) == 0
+
+
+def test_clear_search_results_empties_every_gallery_source():
+    """active_product outranks search results in get_gallery_items, so it must
+    also be cleared or the gallery repopulates right after "Clear Gallery"."""
+    from agentic_commerce.ui.chat_engine import get_gallery_items
+
+    session = get_or_create_session("test_clear_all_sources")
+    session.update_search_results([{"id": "gid://1", "title": "Sneaker"}])
+    session.active_product = {
+        "id": "gid://2",
+        "title": "Boot",
+        "media": [{"type": "image", "url": "https://cdn.example/boot.jpg"}],
+    }
+    session.update_web_results([{"title": "Web hit", "url": "https://x.com"}])
+    assert get_gallery_items(session), "precondition: gallery is populated"
+
+    session.clear_search_results()
+
+    assert session.active_product is None
+    assert session.last_web_results == []
+    assert get_gallery_items(session) == []

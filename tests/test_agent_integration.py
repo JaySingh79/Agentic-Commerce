@@ -3,10 +3,9 @@
 from agentic_commerce.backend.agent import CommerceAgent
 from agentic_commerce.backend.ap2 import AP2Engine
 from agentic_commerce.backend.session import get_or_create_session
-from agentic_commerce.backend.tools import (
-    ALL_COMMERCE_TOOLS,
-    generate_ap2_mandate,
-)
+from agentic_commerce.backend.tools import ALL_COMMERCE_TOOLS
+
+generate_ap2_mandate = {t.name: t for t in ALL_COMMERCE_TOOLS}["generate_ap2_mandate"]
 
 
 def test_ap2_engine_mandate_lifecycle():

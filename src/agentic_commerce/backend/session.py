@@ -4,10 +4,13 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 
-# Context variable to track active session ID per request context
-_ACTIVE_SESSION_ID: ContextVar[str] = ContextVar(
-    "active_session_id", default="default_user_session"
-)
+DEFAULT_SESSION_ID = "default_user_session"
+
+# Fallback-only session routing. This is NOT reliable across Gradio's per-step
+# threadpool (a var set inside a generator is invisible to a later step running
+# on another worker), so anything correctness-critical must pass session_id
+# explicitly — see agentic_commerce.backend.tools.make_commerce_tools.
+_ACTIVE_SESSION_ID: ContextVar[str] = ContextVar("active_session_id", default=DEFAULT_SESSION_ID)
 
 
 @dataclass
@@ -16,10 +19,13 @@ class CommerceSession:
 
     history: list[dict[str, str]] = field(default_factory=list)
     last_searched_products: list[dict[str, Any]] = field(default_factory=list)
+    last_web_results: list[dict[str, Any]] = field(default_factory=list)
     active_product: dict[str, Any] | None = None
     active_cart: dict[str, Any] | None = None
     active_mandate: dict[str, Any] | None = None
     active_checkout: dict[str, Any] | None = None
+    active_negotiation: dict[str, Any] | None = None
+    active_payment: dict[str, Any] | None = None
 
     def add_message(self, role: str, content: str) -> None:
         """Appends a message to the session history."""
@@ -28,6 +34,29 @@ class CommerceSession:
     def update_search_results(self, products: list[dict[str, Any]]) -> None:
         """Stores the latest searched products."""
         self.last_searched_products = products
+
+    def update_negotiation(self, negotiation: dict[str, Any]) -> None:
+        """Stores the latest A2A negotiation outcome and transcript."""
+        self.active_negotiation = negotiation
+
+    def update_payment(self, payment: dict[str, Any]) -> None:
+        """Stores the latest test-mode payment receipt."""
+        self.active_payment = payment
+
+    def update_web_results(self, results: list[dict[str, Any]]) -> None:
+        """Stores the latest internet search results (non-UCP listings)."""
+        self.last_web_results = results
+
+    def clear_search_results(self) -> None:
+        """Clears every product source the gallery reads from.
+
+        ``active_product`` must be cleared too: ``get_gallery_items`` prefers it
+        over search results, so leaving it set made the gallery repopulate on the
+        next render after the user pressed "Clear Gallery".
+        """
+        self.last_searched_products = []
+        self.last_web_results = []
+        self.active_product = None
 
     def update_cart(self, cart: dict[str, Any]) -> None:
         """Stores the active Universal Cart."""

@@ -4,9 +4,15 @@ import os
 from collections.abc import Generator
 from typing import Any
 
-from agentic_commerce.backend.agent import COMMERCE_SYSTEM_PROMPT, CommerceAgent
+from agentic_commerce.backend.agent import (
+    COMMERCE_SYSTEM_PROMPT,
+    CommerceAgent,
+    _serialize_products,
+)
 from agentic_commerce.backend.session import CommerceSession, get_or_create_session
 from agentic_commerce.backend.tools import primary_image_url
+from agentic_commerce.core.telemetry import get_latest_session_stats
+from agentic_commerce.ui.cards import render_results_panel
 
 DEFAULT_SYSTEM_PROMPT = COMMERCE_SYSTEM_PROMPT
 DEFAULT_MODEL = os.getenv("MODEL") or "gemini-2.5-flash"
@@ -20,6 +26,22 @@ def _price_str(product: dict[str, Any]) -> str:
         if variants and isinstance(variants[0], dict):
             amount = variants[0].get("price", {}).get("amount")
     return f"${(amount / 100):.2f}" if amount else ""
+
+
+def _telemetry_badge(session_id: str) -> str:
+    """Renders the per-turn token/tool/latency badge appended to a reply."""
+    stat = get_latest_session_stats(session_id)
+    if not (stat.get("total_tokens", 0) > 0 or stat.get("tools_called")):
+        return ""
+    tools = stat.get("tools_called") or []
+    tools_info = f" • Tools: {len(tools)}" if tools else ""
+    tok_details = (
+        f"({stat.get('prompt_tokens', 0)} prompt / {stat.get('completion_tokens', 0)} comp)"
+    )
+    return (
+        f"\n\n> 📊 **Telemetry:** {stat.get('total_tokens', 0)} tokens "
+        f"{tok_details}{tools_info} • {stat.get('latency_seconds', 0.0):.2f}s"
+    )
 
 
 def _card(product: dict[str, Any]) -> str:
@@ -222,15 +244,35 @@ class ChatEngine:
                             cap = f"**{title}** — {price}" if price else f"**{title}**"
                             tmp_cards.append(f"![{alt}]({url})\n{cap}")
                     if tmp_cards:
-                            cards = "**Product previews**\n\n" + "\n\n".join(tmp_cards)
-                            yield render()
+                        cards = "**Product previews**\n\n" + "\n\n".join(tmp_cards)
+                        yield render()
             elif etype == "content":
                 answer += event.get("text", "")
                 yield render()
             # "status" events are internal; not surfaced verbatim.
 
+        stat = get_latest_session_stats(session_id)
+        telemetry_badge = ""
+        if stat.get("total_tokens", 0) > 0 or stat.get("tools_called"):
+            tools_info = (
+                f" • Tools: {len(stat.get('tools_called', []))}"
+                if stat.get("tools_called")
+                else ""
+            )
+            tok_details = (
+                f"({stat.get('prompt_tokens', 0)} prompt / "
+                f"{stat.get('completion_tokens', 0)} comp)"
+            )
+            telemetry_badge = (
+                f"\n\n> 📊 **Telemetry:** {stat.get('total_tokens', 0)} tokens "
+                f"{tok_details}{tools_info} • {stat.get('latency_seconds', 0.0):.2f}s"
+            )
+
         if not answer:
-            yield render() if (trace_lines or cards) else "Done — no textual response generated."
+            base = render() if (trace_lines or cards) else "Done — no textual response generated."
+            yield base + telemetry_badge
+        else:
+            yield render() + telemetry_badge
 
     def stream_with_gallery(
         self,
@@ -240,11 +282,16 @@ class ChatEngine:
         temperature: float = 0.4,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         session_id: str = "default_user_session",
-    ) -> Generator[tuple[str, list[tuple[str, str]]], None, None]:
-        """Streams (chat_markdown, gallery_items) for the two-pane UI."""
+    ) -> Generator[tuple[str, list[tuple[str, str]], str], None, None]:
+        """Streams (chat_markdown, gallery_items, results_html) for the UI.
+
+        Product imagery is emitted as ``results_html`` (a CSS grid, see
+        ``ui/cards.py``) rather than Markdown images in the chat bubble, because
+        Markdown images can only stack one per line.
+        """
         user_text = message.strip()
         if not user_text:
-            yield "Please provide a query or instruction.", []
+            yield "Please provide a query or instruction.", [], render_results_panel([], [])
             return
 
         agent = self._get_agent(session_id, model_name or DEFAULT_MODEL, temperature)
@@ -252,7 +299,7 @@ class ChatEngine:
 
         trace_lines: list[str] = []
         answer = ""
-        cards = ""
+        products: list[dict[str, Any]] = _serialize_products(session.last_searched_products)
         gallery: list[tuple[str, str]] = get_gallery_items(session)
 
         def render_chat() -> str:
@@ -261,12 +308,12 @@ class ChatEngine:
                 parts.append("\n".join(trace_lines))
             if answer:
                 parts.append(answer)
-            if cards:
-                parts.append(cards)
             return "\n\n".join(parts) or "…"
 
-        # initial gallery render
-        yield render_chat(), gallery
+        def render_panel() -> str:
+            return render_results_panel(products, session.last_web_results)
+
+        yield render_chat(), gallery, render_panel()
 
         for event in agent.execute_stream(
             message=user_text, history=history, system_prompt=system_prompt
@@ -276,34 +323,34 @@ class ChatEngine:
                 tname = event.get("tool", "")
                 ttext = event.get("text", f"Running `{tname}`...")
                 trace_lines.append(f"> 🔧 {ttext}")
-                yield render_chat(), gallery
+                yield render_chat(), gallery, render_panel()
             elif etype == "tool_result":
                 tool = event.get("tool")
-                if tool == "search_products":
-                    cards = _search_cards(session)
+                if tool in {"search_products", "get_product_details"}:
                     gallery = get_gallery_items(session)
-                elif tool == "get_product_details":
-                    cards = _product_card(session)
-                    gallery = get_gallery_items(session)
-                if cards or gallery:
-                    yield render_chat(), gallery
+                    products = _serialize_products(
+                        [session.active_product]
+                        if tool == "get_product_details" and session.active_product
+                        else session.last_searched_products
+                    )
+                yield render_chat(), gallery, render_panel()
             elif etype == "products":
                 prods = event.get("products", [])
                 if prods:
+                    products = prods
                     gallery = products_to_gallery(prods)
-                    if not cards:
-                        tmp = []
-                        for url, cap in gallery:
-                            alt = cap.replace("[", "").replace("]", "")
-                            tmp.append(f"![{alt}]({url})\n**{cap}**")
-                        if tmp:
-                            cards = "**Product previews**\n\n" + "\n\n".join(tmp)
-                    yield render_chat(), gallery
+                yield render_chat(), gallery, render_panel()
             elif etype == "content":
                 answer += event.get("text", "")
-                yield render_chat(), gallery
+                yield render_chat(), gallery, render_panel()
 
-        if not answer and not trace_lines and not cards:
-            yield "Done — no textual response generated.", gallery
+        telemetry_badge = _telemetry_badge(session_id)
+
+        if not answer and not trace_lines:
+            yield (
+                f"Done — no textual response generated.{telemetry_badge}",
+                gallery,
+                render_panel(),
+            )
         else:
-            yield render_chat(), gallery
+            yield render_chat() + telemetry_badge, gallery, render_panel()

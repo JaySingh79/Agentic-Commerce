@@ -34,7 +34,7 @@ def build_custom_theme() -> gr.Theme:
 CUSTOM_CSS = """
 footer { visibility: hidden !important; }
 .gradio-container {
-    max-width: 1040px !important;
+    max-width: 1360px !important;
     margin: 0 auto !important;
 }
 /* Roomier, cleaner chat bubbles */
@@ -52,7 +52,7 @@ footer { visibility: hidden !important; }
     border-radius: 999px !important;
     font-size: 0.85rem !important;
 }
-/* Cap product-preview images (Markdown) rendered in chat bubbles */
+/* Cap any stray Markdown image still rendered inside a chat bubble */
 [class*="message"] img,
 .prose img {
     max-width: 190px !important;
@@ -60,6 +60,83 @@ footer { visibility: hidden !important; }
     border-radius: 10px;
     margin: 6px 0 2px;
     display: block;
+}
+
+/* ---------------- Product result grid (gr.HTML panel, see ui/cards.py) ------
+   Markdown images can only stack one-per-line, so results are rendered as a
+   real CSS grid here: cards flow in blocks and reflow by available width. */
+.ac-results { margin: 4px 0 14px; }
+.ac-grid-head {
+    font-weight: 600;
+    font-size: 0.95rem;
+    margin: 10px 0 2px;
+    opacity: 0.9;
+}
+.ac-grid-note { font-size: 0.8rem; opacity: 0.65; margin-bottom: 8px; }
+.ac-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    gap: 12px;
+    align-items: stretch;
+}
+.ac-card {
+    display: flex;
+    flex-direction: column;
+    text-decoration: none !important;
+    color: inherit !important;
+    background: rgba(17, 24, 39, 0.55);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
+    overflow: hidden;
+    transition: transform 0.12s ease, border-color 0.12s ease;
+}
+.ac-card:hover {
+    transform: translateY(-2px);
+    border-color: rgba(99, 102, 241, 0.6);
+}
+.ac-card-media {
+    aspect-ratio: 1 / 1;
+    background: #0f1626;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.ac-card-media img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    margin: 0 !important;
+    max-width: none !important;
+    border-radius: 0;
+}
+.ac-card-body { padding: 8px 10px 10px; display: flex; flex-direction: column; gap: 3px; }
+.ac-card-title {
+    font-size: 0.85rem;
+    font-weight: 600;
+    line-height: 1.25;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+.ac-card-sub { font-size: 0.82rem; opacity: 0.8; }
+.ac-card-badge {
+    align-self: flex-start;
+    font-size: 0.68rem;
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: rgba(99, 102, 241, 0.18);
+    border: 1px solid rgba(99, 102, 241, 0.35);
+    opacity: 0.9;
+}
+.ac-empty { opacity: 0.55; font-size: 0.88rem; padding: 10px 2px; }
+/* Telemetry badge in chat */
+.message-row blockquote {
+    border-left: 3px solid #6366f1 !important;
+    background: rgba(99, 102, 241, 0.08) !important;
+    padding: 6px 12px !important;
+    border-radius: 6px;
+    font-size: 0.88rem !important;
 }
 /* Product gallery styling */
 #product-gallery {
@@ -73,6 +150,14 @@ footer { visibility: hidden !important; }
 }
 .gallery-hint, .gallery-help {
     opacity: 0.85;
+    font-size: 0.85rem;
+}
+.telemetry-card {
+    background: rgba(31, 41, 55, 0.4);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 10px;
+    padding: 8px 12px;
+    margin-top: 10px;
     font-size: 0.85rem;
 }
 """

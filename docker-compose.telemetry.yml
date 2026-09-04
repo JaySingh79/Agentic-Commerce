@@ -1,0 +1,62 @@
+services:
+  # Single OTLP entrypoint for the app: traces -> Tempo, metrics -> Prometheus.
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.104.0
+    container_name: agentic-commerce-otel-collector
+    command: ["--config=/etc/otel-collector.yaml"]
+    volumes:
+      - ./telemetry/otel-collector.yaml:/etc/otel-collector.yaml
+    ports:
+      - "4317:4317"   # OTLP gRPC receiver (app -> collector)
+      - "4318:4318"   # OTLP HTTP receiver (app -> collector)
+      - "8889:8889"   # Prometheus scrape endpoint
+    depends_on:
+      - tempo
+
+  tempo:
+    image: grafana/tempo:2.4.1
+    container_name: agentic-commerce-tempo
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./telemetry/tempo.yaml:/etc/tempo.yaml
+      - tempo-data:/var/tempo
+    ports:
+      - "3200:3200"   # Tempo HTTP query API
+    # 4317/4318 stay internal: the collector owns the host OTLP ports.
+    expose:
+      - "4317"
+      - "4318"
+
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: agentic-commerce-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=24h
+    volumes:
+      - ./telemetry/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - otel-collector
+
+  grafana:
+    image: grafana/grafana:10.4.1
+    container_name: agentic-commerce-grafana
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+    volumes:
+      - ./telemetry/grafana/provisioning:/etc/grafana/provisioning
+      - ./telemetry/grafana/dashboards:/etc/grafana/provisioning/dashboards
+    ports:
+      - "3000:3000"   # Grafana Web UI
+    depends_on:
+      - tempo
+      - prometheus
+
+volumes:
+  tempo-data:
+  prometheus-data:
