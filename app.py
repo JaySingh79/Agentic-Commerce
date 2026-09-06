@@ -9,4 +9,5 @@ from agentic_commerce.ui import launch_chat_app  # noqa: E402
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
-    launch_chat_app(port=port)
+    host = os.environ.get("HOST", "127.0.0.1")
+    launch_chat_app(port=port, server_name=host)

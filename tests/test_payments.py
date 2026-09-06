@@ -14,6 +14,7 @@ from agentic_commerce.backend.payments import (
     select_provider,
 )
 from agentic_commerce.core.runtime import run_async
+from agentic_commerce.payments import gateway as payment_gateway
 
 PAYMENT_ENV = (
     "RAZORPAY_KEY_ID",
@@ -98,8 +99,8 @@ def test_razorpay_failure_falls_back_to_stripe(monkeypatch: pytest.MonkeyPatch):
             live=False,
         )
 
-    monkeypatch.setattr(payments, "_charge_razorpay", _boom)
-    monkeypatch.setattr(payments, "_charge_stripe", _stripe_ok)
+    monkeypatch.setattr(payment_gateway, "_charge_razorpay", _boom)
+    monkeypatch.setattr(payment_gateway, "_charge_stripe", _stripe_ok)
 
     result = run_async(process_payment(2400, "USD"))
     assert result.provider == "stripe"
@@ -113,8 +114,8 @@ def test_both_providers_failing_still_yields_a_receipt(monkeypatch: pytest.Monke
     async def _boom(*_args, **_kwargs):
         raise httpx.ConnectError("down")
 
-    monkeypatch.setattr(payments, "_charge_razorpay", _boom)
-    monkeypatch.setattr(payments, "_charge_stripe", _boom)
+    monkeypatch.setattr(payment_gateway, "_charge_razorpay", _boom)
+    monkeypatch.setattr(payment_gateway, "_charge_stripe", _boom)
 
     assert run_async(process_payment(2400, "USD")).provider == "simulated"
 

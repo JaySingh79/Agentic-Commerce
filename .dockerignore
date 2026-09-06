@@ -1,0 +1,33 @@
+# Keep the image lean and secret-free: runtime config comes from compose env_file.
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+.env
+.env.*
+!.env.example
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.vscode/
+.claude/
+.opencode/
+.serena/
+agents/
+skills/
+.firecrawl/
+.playwright-mcp/
+.playwright/
+telemetry/
+tests/
+node_modules/
+# Local scratch / caches / logs (incl. check.py: throwaway script, don't ship it).
+check.py
+logs.txt
+result.json
+*.log
+.agentic_commerce/
+watcher.ignore
+.watcherignore

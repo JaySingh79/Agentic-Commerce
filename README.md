@@ -1,47 +1,323 @@
-# Project README Template
+# Agentic Commerce
 
-Brief introduction to the project, its core value proposition, and quick links.
+An autonomous e-commerce agent platform: natural-language product discovery over
+Shopify's **Universal Commerce Protocol (UCP)**, A2A buyer/merchant negotiation,
+AP2 payment mandates, and test-mode payment capture — behind two coexisting
+frontends and one typed HTTP API.
 
-## Table of Contents
-- [Prerequisites](#prerequisites)
-- [Installation](#installation)
-- [Usage](#usage)
-- [AI Workflow](#ai-workflow)
-- [Deployment](#deployment)
+**Entrances:** Gradio chat on `http://localhost:7860` · vanilla-JS storefront + HTTP API on `http://localhost:8010` (served by the same FastAPI process).
 
-## Prerequisites
-- List any software required, such as:
-  - [Node.js](https://nodejs.org/) (v18+)
-  - [Python](https://www.python.org/) (v3.10+)
-  - [Git](https://git-scm.com/)
+---
 
-## Installation
-How to set up the local development environment:
-```bash
-# Clone the repository
-git clone https://github.com/user/repo-name.git
-cd repo-name
+## Table of contents
 
-# Install dependencies (choose the one applicable to your stack)
-npm install
-# OR
-pip install -r requirements.txt
+- [1. What this is](#1-what-this-is)
+- [2. Quickstart](#2-quickstart)
+- [3. Playing with it](#3-playing-with-it)
+- [4. The HTTP API](#4-the-http-api)
+- [5. Configuration reference](#5-configuration-reference)
+- [6. Developer guide: augmenting the system](#6-developer-guide-augmenting-the-system)
+- [7. Tests, lint, and the definition of done](#7-tests-lint-and-the-definition-of-done)
+- [8. Docker reference](#8-docker-reference)
+- [9. Safety model (read this before touching payments)](#9-safety-model-read-this-before-touching-payments)
+- [10. Troubleshooting](#10-troubleshooting)
+
+---
+
+## 1. What this is
+
+A shopper types *"breathable running shirt under $60"*. Behind that sentence a
+**concierge** fans work out to specialist agents that run in parallel —
+`CatalogScout` (Shopify UCP Global Catalog), `WebScout` (open web),
+`Negotiator` (A2A price haggling with a merchant agent), `Cashier`
+(test-mode payment), `Analyst` (multi-criterion ranking that names a winner
+*and its blind spots*). The turn streams back as typed events; every claim the
+UI renders is backed by a structured payload, never by model prose.
+
+Layering (see `FEATURES.md` for the full record):
+
+```
+Domain (UI-independent)      Agent runtime          Transports
+a2a/  ap2/  core/  ucp/      backend/               api/  ui/  web/
+payments/ ── thin shim ──→   backend/payments.py    (re-export only)
 ```
 
-## Usage
-How to run scripts, start servers, or execute tests:
-```bash
-# Run local dev server
-npm run dev
+- **Domain packages** (`a2a/`, `ap2/`, `core/`, `ucp/`, `payments/`) own business
+  logic and return structured data. They know nothing about any UI.
+- **`backend/`** is the agent runtime (agent loop, crew, tools, session store).
+  `backend/payments.py` and `backend/ap2.py` are **thin re-export shims** so
+  import paths stay stable while logic lives in the domain packages.
+- **`api/` + `ui/` + `web/`** are transports over the same domain. The real
+  boundary is the **SSE contract** (`status`, `content`, `tool_call`,
+  `tool_result`, `products`, `crew`, `artifact`, `done`, `error`) — that's what
+  made a second frontend cheap instead of a rewrite.
 
-# Run test suite
-npm run test
+Key protocol facts live in `project_memory.md` (UCP spec versions, auth tiers,
+MCP tool glossary) and `project_context.md` (endpoints, key files).
+
+---
+
+## 2. Quickstart
+
+### Prerequisites
+
+- Python 3.11+ managed through **[uv](https://docs.astral.sh/uv/)** (`uv run`,
+  `uv sync` — never raw `pip`/`python` for project work)
+- Docker + Docker Compose (for the containerised stack)
+- API keys: Google Gemini (`GEMINI_API_KEY` or `GOOGLE_API_KEY`) for the agent;
+  Shopify `CLIENT_ID`/`CLIENT_SECRET` for catalog/auth; Razorpay test keys for
+  payments. Everything is read from `.env` — **never baked into images**.
+
+### Option A — Docker (recommended)
+
+```bash
+docker compose up -d --build
+# Gradio chat .... http://localhost:7860
+# API + web UI ... http://localhost:8010
+docker compose logs -f api ui
 ```
 
-## AI Workflow
-This project utilizes the **Global Skill and Memory Layer**.
-- Global memory points to: `memory.md` (which maps back to the master global memory).
-- Global skills point to: `skills.md` (which maps back to the master global skills).
-- Project-specific configuration is isolated in:
-  - [project_context.md](file:///D:/AI/global/templates/project_context.md) (static facts)
-  - [project_memory.md](file:///D:/AI/global/templates/project_memory.md) (dynamic conventions and learnings)
+This starts `api`, `ui`, and a compose-managed `razorpay-mcp` container
+(`agentic-commerce-razorpay-mcp`, so it never clashes with a standalone one).
+With telemetry:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.telemetry.yml up -d
+# Grafana http://localhost:3000 · Prometheus http://localhost:9090
+```
+
+### Option B — local processes
+
+```bash
+uv sync
+uv run python -m agentic_commerce.api.server  # API + web UI on :8010
+uv run python app.py                           # Gradio chat on :7860
+```
+
+`HOST`/`PORT` (Gradio) and `HOST`/`API_PORT` (API) are env-overridable; both
+default to `127.0.0.1`.
+
+### Verify your setup
+
+```bash
+uv run ruff check src tests   # lint: clean
+uv run pytest -q              # 213 passed, ~60s, across 23 test files
+curl http://localhost:8010/openapi.json | head -c 200   # API alive
+curl -o /dev/null -w "%{http_code}" http://localhost:7860/  # UI alive → 200
+```
+
+---
+
+## 3. Playing with it
+
+Start here — each experiment exercises one subsystem and tells you where to
+look next.
+
+**1. Search something real.** In either frontend: *"breathable running shirt
+under $60"*. Watch the crew events stream in (`CatalogScout` + `WebScout` race
+via `asyncio.gather` in `backend/crew.py`). Then try a thin query the catalog
+won't have (*"niche trail runners"*) and notice the UI tells you which source
+came back empty instead of failing the turn.
+
+**2. Ask for the best pick.** *"Which of these should I buy?"* routes to the
+Analyst (`backend/analyst.py`). Open the score breakdown: missing signals are
+*dropped and renormalized*, never scored as zero, and the winner's blind spots
+travel in `ProductScore.missing`. Try: an unrated product — it carries *no
+rating key at all*, never zero stars.
+
+**3. Haggle.** The A2A negotiator (`a2a/`) bargains buyer-vs-merchant and
+returns a structured `NegotiationResult` with rounds, transcript, and savings.
+
+**4. Mint a mandate.** *"Generate an AP2 checkout payment mandate for my
+active cart."* You get a signed HMAC-SHA256 ticket with a live expiry
+countdown, one-click signature verification, copy-JSON, and a raw-payload
+disclosure (`ap2/mandate.py`, `POST /api/mandate`, `POST /api/mandate/verify`).
+Tamper with the JSON and re-verify — *expired* and *tampered* are distinguished,
+never collapsed into "invalid".
+
+**5. Capture test money.** `POST /api/payments/test`
+`{"amount_cents": 100, "currency": "INR"}` routes Razorpay → Stripe → simulated
+(`payments/gateway.py`). With `RAZORPAY_MCP_BRIDGE=1` the order is created
+*through the local `razorpay-mcp` container* over MCP/JSON-RPC
+(`payments/mcp.py`); otherwise direct REST. Every receipt carries `live`, and
+the UI badge renders from that field — try a simulated capture and confirm it
+says TEST / SIMULATED.
+
+**6. Inspect your session as a graph.** `GET /api/session/{id}/graph` renders
+the session as nodes/edges (~19× fewer tokens than the raw snapshot;
+`backend/session_graph.py`). `GET /api/telemetry/{session_id}` shows spans and
+token accounting per turn.
+
+**7. Break the payment guard (safely).** Set `RAZORPAY_KEY_ID=rzp_live_...` and
+call the test endpoint — it refuses and degrades to the simulated gateway.
+That guard is the load-bearing safety test in `tests/test_payments.py`; an
+autonomous agent must never move real money.
+
+---
+
+## 4. The HTTP API
+
+21 paths, documented in `openapi.json` (OpenAPI 3.1.0, hand-kept in sync —
+every `$ref` resolves, every path maps to a real callable). Groups:
+
+| Group | Endpoints |
+|---|---|
+| Chat (SSE) | `POST /api/chat/stream`, `GET /api/examples`, `GET /api/models` |
+| Discovery | `POST /api/search/products`, `POST /api/search/web`, `POST /api/discovery`, `GET /api/products/{id}`, `POST /api/analysis/best-pick` |
+| Cart & checkout | `POST /api/cart`, `GET/PUT /api/cart/{id}` (PUT is full replacement), `POST /api/checkout` |
+| Negotiation | `POST /api/negotiate` |
+| Mandates | `POST /api/mandate`, `POST /api/mandate/verify` |
+| Payments (test-mode) | `POST /api/payments/test` |
+| Session & introspection | `POST /api/session`, `GET /api/session/{id}`, `GET /api/session/{id}/results`, `GET /api/session/{id}/graph`, `GET /api/telemetry/{id}`, `GET /api/health` |
+
+The streaming vocabulary (`status`, `content`, `tool_call`, `tool_result`,
+`products`, `crew`, `artifact`, `done`, `error`) is emitted by
+`CommerceAgent.execute_stream` and is the contract any new client builds
+against — see `web/app.js` for the reference consumer.
+
+---
+
+## 5. Configuration reference
+
+All via environment (`.env` locally, `env_file` in compose):
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `MODEL` | Gemini model id (`backend/model.py`, `ui/chat_engine.py`) | `gemini-2.5-flash` |
+| `GEMINI_API_KEY` / `GOOGLE_API_KEY` | LLM auth | — (chat turns fail without it) |
+| `CLIENT_ID` / `CLIENT_SECRET` | Shopify OAuth + webhook HMAC + AP2 signing | — (catalog works in lower tiers) |
+| `CATALOG_ID` | Custom catalog whitelist; empty = Global Catalog | `''` |
+| `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` | Razorpay (test keys `rzp_test_*` only) | — (simulated gateway) |
+| `STRIPE_SECRET_KEY` / `STRIPE_API_KEY` | Stripe fallback (`sk_test_*` only) | — |
+| `RAZORPAY_MCP_BRIDGE=1` | Route Razorpay orders through the local MCP container | off (direct REST) |
+| `RAZORPAY_MCP_CONTAINER` / `RAZORPAY_MCP_TOOLSETS` | Bridge target and server-side tool scope | `razorpay-mcp` / `orders,payments` |
+| `TAVILY_API_KEY` | Web search provider (else DuckDuckGo) | — |
+| `AC_SESSION_PERSIST` / `AC_SESSION_DB` | SQLite session snapshots on/off + path | on / `.agentic_commerce/sessions.db` (compose: `/data/sessions.db` shared volume) |
+| `HOST` / `PORT` / `API_PORT` | Bind host + Gradio/API ports | `127.0.0.1` / `7860` / `8010` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_SDK_DISABLED` | Telemetry export | `http://localhost:4318` / enabled |
+
+---
+
+## 6. Developer guide: augmenting the system
+
+### Add an agent tool (the most common extension)
+
+1. Write the domain function returning **structured data** (dict/dataclass with
+   `as_dict()`), e.g. in `backend/` or a domain package — never Markdown.
+2. Wrap it as a LangChain `@tool` in `backend/tools.py` that formats Markdown
+   *for the model only* and records progress via `trace_tool_execution`.
+3. Add behaviour-named tests (`test_<invariant>_...`, not `test_<function>_...`).
+4. If it needs HTTP exposure, add a thin route in `api/server.py` calling the
+   domain function directly (skip the Markdown), and mirror it in
+   `openapi.json`.
+
+### Add a payment capability
+
+`payments/` is the home: `config.py` (env/guard/selection), `razorpay.py`
+(REST + HMAC verifies), `mcp.py` (container bridge), `gateway.py`
+(orchestration), `models.py` (`PaymentResult`). Rules:
+
+- Raw `httpx` — **no payment SDK becomes a dependency** (project decision).
+- Every receipt states `live`; test keys only (`rzp_test_*`, `sk_test_*`).
+- `backend/payments.py` stays a re-export shim — update it when you add a
+  public name so `crew`/`tools`/`server` imports keep working.
+- Razorpay has no idempotency header: `receipt` **is** the dedupe key.
+
+### Extend the MCP bridge
+
+`payments/mcp.py` speaks JSON-RPC over `docker exec -i` stdio because the
+`razorpay/mcp` image is stdio-only. To expose more tools (refunds, payment
+links, settlements — all present in the container's `tools/list`), add a thin
+`mcp_<thing>` wrapper mapping `content[0].text` JSON onto `PaymentResult` and
+cover it with a hermetic test (fake `subprocess.run`, see
+`tests/test_payments_mcp.py`). Live-container checks stay manual and
+read-only where possible (`fetch_*` before any write).
+
+### Build a third frontend
+
+Consume `POST /api/chat/stream` SSE events and the REST paths above; respect
+the honesty invariants or the UI is buggy by definition: `PaymentResult.live`
+always rendered; missing ratings absent, never zero; `ProductScore.missing`
+surfaced; web results get **no** cart button (absence, not a disabled button);
+review counts labelled popularity, never sales.
+
+### Work with the docs
+
+- `project_memory.md` — protocol truth (versions, tiers, tool specs). Update it
+  when UCP/MCP behaviour changes.
+- `project_context.md` — static facts (stack, endpoints, key files).
+- `FEATURES.md` — what *runs today*, including a plain **Not built yet** list
+  (no capture, no mandate-gated charges, no webhooks/refunds/orders store).
+  Keep it honest: don't list it until it runs.
+
+---
+
+## 7. Tests, lint, and the definition of done
+
+```bash
+uv run ruff check src tests          # E,F,I,UP,B,SIM · line-length 100
+uv run pytest -q                     # 213 passed · 23 files · ~60s
+uv run pytest tests/test_payments.py tests/test_payments_mcp.py -q
+```
+
+The four-step loop is mandatory before anything is called done: trace the root
+cause → minimal anchored edit → `ruff` + `pytest` → clean exit code required.
+No symptom patching: never swallow exceptions, invent fallbacks, or
+delete/comment-out failing tests. A test that documents an outdated contract
+may change only as an explicitly declared contract change. Browser JS
+(`web/app.js`) is covered from pytest via a Node `vm` harness
+(`tests/js/markdown_harness.mjs`) — no JS runner needed.
+
+---
+
+## 8. Docker reference
+
+```bash
+docker compose up -d --build        # api :8010 · ui :7860 · razorpay-mcp (stdio)
+docker compose ps                   # all three healthy
+docker compose logs -f api ui
+docker compose down                 # stack down; session-data volume persists
+```
+
+- Image: `python:3.13-slim` + `uv sync --locked --no-dev`; Docker CLI included
+  for the MCP bridge; non-root `appuser` by default.
+- Compose runs app services as `user: "0:0"` — required because the host
+  `docker.sock` is `660 root:root` and the bridge shells out to `docker exec`.
+  Local-dev tradeoff, documented in `docker-compose.yml`; the image default is
+  unchanged.
+- `razorpay-mcp` here is named `agentic-commerce-razorpay-mcp` so it never
+  collides with a standalone `razorpay-mcp` container.
+- UCP demo scripts (`backend/*_demo.js`, `ucp_demo.js`) run via Node and are
+  intentionally *not* in the image: `node --env-file=.env
+  src/agentic_commerce/backend/ucp_demo.js`.
+
+---
+
+## 9. Safety model (read this before touching payments)
+
+1. **Test keys only.** `rzp_test_*` / `sk_test_*`; anything else raises
+   `PaymentConfigurationError`. Stripe PaymentIntents are created, never
+   confirmed; Razorpay Orders are created, never paid. **Nothing in this repo
+   moves money, including in test mode.**
+2. **Honesty is structural.** Missing data is absent (no rating key, no cart
+   button, `live` always present) so no model paraphrase can turn a caveat
+   into a claim.
+3. **Independent failure.** Either scout, either payment provider can fail and
+   the turn degrades with the gap named — never a silent total failure.
+4. **Sessions are bearer capabilities** (`ac_session` cookie + header +
+   `localStorage`) over plain HTTP — fine for local dev, not a production
+   auth story (see `FEATURES.md` §7).
+
+---
+
+## 10. Troubleshooting
+
+| Symptom | Likely cause → fix |
+|---|---|
+| `401`/`-32000 AuthenticationFailed` on merchant checkout | Store restricts programmatic checkout → Cart MCP `continue_url` referral handoff is the universal path (`project_memory.md` §4.2) |
+| Catalog searches return nothing | Custom `CATALOG_ID` whitelist is empty/restrictive → unset it for Global Catalog |
+| Payments always `simulated` | No test keys in env, or bridge off with no keys → set `rzp_test_*` keys / `RAZORPAY_MCP_BRIDGE=1` |
+| `docker exec` permission denied in container | Host socket is root-only → keep the compose `user: "0:0"` override |
+| UI shows previous turn's agents on chit-chat | Regression of the `execute_stream`/`_stream_turn` identity fix — see `FEATURES.md` §5 |
+| Clicks do nothing (dark tint over page) | `[hidden]` display regression — `web/styles.css` guard + `tests/test_web_assets.py` |
+| `uv sync` fails in Docker build | Stale lockfile → `uv lock` locally, rebuild; never hand-edit `uv.lock` |
