@@ -1,0 +1,2615 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Agentic Commerce API",
+    "version": "1.0.0",
+    "summary": "Frontend↔backend contract for the Agentic Commerce UI.",
+    "description": "Every operation in this document is a thin HTTP wrapper over a function that **already exists** in the Python package, named in each operation's `x-backs-onto` field. The domain layer already returns structured data (`WebResult.as_dict`, `CrewEvent.as_dict`, `BestPick.as_dict`, `PaymentResult.as_dict`, `NegotiationResult.as_dict`, raw UCP product dicts, signed AP2 mandate dicts); only the LangChain *tool* layer wraps those in Markdown for the model to read. This API calls the domain layer directly and skips the Markdown, so a new UI can be built in any stack with **no changes to the agent, crew, analyst, payments, or A2A code**.\n\n## Honesty invariants the client must respect\n\nThese are not stylistic. They are encoded in the backend and the UI must not contradict them.\n\n1. **`PaymentResult.live` is always present.** `backend/payments.py` refuses any key that is not `rzp_test_*` / `sk_test_*`, so a payment is test-mode or simulated. A receipt that does not say so is a bug.\n2. **`ProductScore.missing` is required.** A criterion the Analyst could not score is *unknown*, not zero. Rendering a missing rating as an empty star row misstates the data.\n3. **`BestPick.caveat` must be surfaced.** The UCP catalog exposes **no purchase-volume field**. Review count is a popularity proxy; no label may imply units sold.\n4. **`WebResult` is not purchasable.** External listings cannot enter a Universal Cart. Clients render no cart affordance on them — absence, not a disabled button.\n\n## Streaming\n\n`POST /api/chat/stream` is Server-Sent Events. OpenAPI cannot fully describe SSE framing, so the response is declared as `text/event-stream` and each event payload is defined as a named schema under the `StreamEvent` `oneOf`, discriminated on `type`. Those event names are not invented for this document — they are the vocabulary `CommerceAgent.execute_stream` already emits, plus `crew` from `CommerceCrew.stream_events`.\n\n## Known defect affecting this contract\n\n`backend/agent.py:252` uses `return` where it must `yield` inside the `execute_stream` generator, which terminates the stream on the first text token. Until that is fixed, `/api/chat/stream` will emit `tool_call`/`tool_result`/`products` events for tool-first turns but will drop `content` events and end the turn early for conversational replies. See `ui_enhancement.md` Part 0.",
+    "contact": {
+      "name": "Agentic Commerce",
+      "url": "https://github.com/"
+    },
+    "license": {
+      "name": "Proprietary",
+      "identifier": "LicenseRef-Proprietary"
+    }
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8000",
+      "description": "Local FastAPI development server"
+    }
+  ],
+  "tags": [
+    {
+      "name": "chat",
+      "description": "Streaming conversation with the concierge agent."
+    },
+    {
+      "name": "session",
+      "description": "Per-shopper state: results, cart, mandate, verdict."
+    },
+    {
+      "name": "discovery",
+      "description": "Catalog and open-web product search."
+    },
+    {
+      "name": "analysis",
+      "description": "The Analyst specialist's best-pick verdict."
+    },
+    {
+      "name": "negotiation",
+      "description": "A2A price negotiation."
+    },
+    {
+      "name": "checkout",
+      "description": "Universal Cart, checkout, AP2 mandate."
+    },
+    {
+      "name": "payments",
+      "description": "Test-mode payment capture."
+    },
+    {
+      "name": "meta",
+      "description": "Health, models, telemetry."
+    }
+  ],
+  "security": [
+    {
+      "sessionCookie": []
+    }
+  ],
+  "paths": {
+    "/api/health": {
+      "get": {
+        "tags": [
+          "meta"
+        ],
+        "operationId": "getHealth",
+        "summary": "Liveness and configured-provider probe.",
+        "description": "Reports which payment provider would be selected and whether a web-search API key is configured, so the UI can set expectations before the shopper hits a dead end.",
+        "x-backs-onto": "agentic_commerce.backend.payments.select_provider",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Service is up.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/models": {
+      "get": {
+        "tags": [
+          "meta"
+        ],
+        "operationId": "listModels",
+        "summary": "Selectable model ids.",
+        "description": "Mirrors `MODEL_CHOICES` in `ui/app.py`: the `MODEL` environment default first, then the common tiers.",
+        "x-backs-onto": "agentic_commerce.ui.chat_engine.DEFAULT_MODEL",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Available models.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "models",
+                    "default"
+                  ],
+                  "properties": {
+                    "models": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "default": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/chat/stream": {
+      "post": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "streamChat",
+        "summary": "Send a message and stream the agent's work as Server-Sent Events.",
+        "description": "Wraps `CommerceAgent.execute_stream`. The response is `text/event-stream`; each SSE `data:` line is one JSON object matching `StreamEvent`.\n\n**Ordering guarantees**\n\n- `status` may appear at any point; it is advisory text only.\n- Every `tool_call` is followed by exactly one `tool_result` for the same `tool`.\n- `products` follows the `tool_result` of a tool that changed the result set (`search_products`, `get_product_details`, `pick_best_product`).\n- `content` events are token deltas and must be **concatenated in arrival order**; they are not whole messages.\n- `crew` events from parallel specialists **interleave**. Do not infer sequencing from arrival order — use `agent` to route each event to its own row and `duration` for elapsed time. Two scouts running concurrently will emit `running` for both before either emits `done`; rendering them as sequential would misrepresent the system.\n- `done` is always the final event of a successful turn. `error` is terminal.\n\n**Cancellation:** closing the connection aborts the turn. Any tool already in flight completes server-side, so partial state may still be written to the session.\n\nSession resolution order: the request body, then the `ac_session` cookie, then a freshly minted id. The response sets `ac_session` (HttpOnly, SameSite=Lax) and echoes the id in `X-Session-Id` and in the `done` event, so a client that keeps the id in local storage and one that relies on the cookie both survive a refresh. The id is a capability token for a durable session (`backend/session_store.py`).",
+        "x-backs-onto": "agentic_commerce.backend.agent.CommerceAgent.execute_stream",
+        "x-sse-events": [
+          "status",
+          "content",
+          "tool_call",
+          "tool_result",
+          "products",
+          "crew",
+          "done",
+          "error"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatRequest"
+              },
+              "examples": {
+                "simple": {
+                  "summary": "A product query",
+                  "value": {
+                    "message": "breathable running shirt under $60",
+                    "session_id": "s_9f2c1a7b4e6d8f01"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "An SSE stream of `StreamEvent` objects.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-cache"
+                }
+              },
+              "X-Accel-Buffering": {
+                "description": "Set to `no` so reverse proxies do not buffer the stream.",
+                "schema": {
+                  "type": "string",
+                  "const": "no"
+                }
+              }
+            },
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamEvent"
+                },
+                "examples": {
+                  "parallelDiscovery": {
+                    "summary": "Two scouts running concurrently, then an answer",
+                    "value": "data: {\"type\":\"status\",\"text\":\"Thinking...\"}\n\ndata: {\"type\":\"tool_call\",\"tool\":\"search_products\",\"args\":{\"query\":\"running shirt\",\"max_price\":60},\"text\":\"Running `search_products`...\"}\n\ndata: {\"type\":\"crew\",\"agent\":\"CatalogScout\",\"status\":\"running\",\"detail\":\"Searching Shopify Global Catalog\"}\n\ndata: {\"type\":\"crew\",\"agent\":\"WebScout\",\"status\":\"running\",\"detail\":\"Searching the open web\"}\n\ndata: {\"type\":\"crew\",\"agent\":\"CatalogScout\",\"status\":\"done\",\"detail\":\"5 catalog match(es)\",\"duration\":0.91,\"payload\":{\"count\":5}}\n\ndata: {\"type\":\"products\",\"products\":[{\"id\":\"gid://shopify/Product/1\",\"title\":\"Cotton Tee\"}]}\n\ndata: {\"type\":\"content\",\"text\":\"Here are five\"}\n\ndata: {\"type\":\"done\",\"session_id\":\"s_9f2c1a7b4e6d8f01\"}\n\n"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        }
+      }
+    },
+    "/api/session/{sessionId}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/SessionId"
+        }
+      ],
+      "get": {
+        "tags": [
+          "session"
+        ],
+        "operationId": "getSession",
+        "summary": "Full snapshot of everything the UI renders outside the transcript.",
+        "description": "One call rehydrates the results grid, gallery, cart badge, best-pick ribbon, and payment receipt — used on page load and after reconnecting a dropped stream.\n\n**Caveat:** sessions are currently held in a process-local dict (`_SESSION_STORE`), so a server restart empties them and a horizontally-scaled deployment will not share them. See `ui_enhancement.md` §1.1.",
+        "x-backs-onto": "agentic_commerce.backend.session.get_or_create_session",
+        "responses": {
+          "200": {
+            "description": "Session snapshot.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionSnapshot"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/api/session/{sessionId}/results": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/SessionId"
+        }
+      ],
+      "delete": {
+        "tags": [
+          "session"
+        ],
+        "operationId": "clearSessionResults",
+        "summary": "Clear search results, web results, active product, and best-pick verdict.",
+        "description": "Backs the \"Clear\" control. Clears every source the gallery reads from, including `active_product` and `best_pick` — leaving either set makes the grid repopulate on the next render, which is the bug this method was written to prevent. Does **not** clear the cart or mandate.",
+        "x-backs-onto": "agentic_commerce.backend.session.CommerceSession.clear_search_results",
+        "responses": {
+          "204": {
+            "description": "Cleared."
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/api/search/products": {
+      "post": {
+        "tags": [
+          "discovery"
+        ],
+        "operationId": "searchCatalog",
+        "summary": "Search the Shopify UCP Global Catalog.",
+        "description": "Direct catalog search with no LLM in the loop — use for filter and sort refinements so changing a price cap does not cost a model round-trip. Results are written into the session.",
+        "x-backs-onto": "agentic_commerce.ucp.client.ShopifyUcpClient.search_catalog",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CatalogSearchRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Matching catalog products.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "products"
+                  ],
+                  "properties": {
+                    "products": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Product"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "502": {
+            "$ref": "#/components/responses/UpstreamError"
+          }
+        }
+      }
+    },
+    "/api/search/web": {
+      "post": {
+        "tags": [
+          "discovery"
+        ],
+        "operationId": "searchWeb",
+        "summary": "Search the open web for listings the catalog does not carry.",
+        "description": "Uses Tavily when `TAVILY_API_KEY` is set, otherwise the keyless DuckDuckGo Lite endpoint. With `with_images=true` each result is enriched concurrently with its `og:image`/`twitter:image`; retailer category pages routinely omit those tags, so `image_url` is frequently `null` and `favicon_url` is the fallback.\n\nResults are **not purchasable** — see the `WebResult` schema.",
+        "x-backs-onto": "agentic_commerce.backend.web_search.search_web",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WebSearchRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Web listings.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "results"
+                  ],
+                  "properties": {
+                    "results": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/WebResult"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "502": {
+            "$ref": "#/components/responses/UpstreamError"
+          }
+        }
+      }
+    },
+    "/api/discovery": {
+      "post": {
+        "tags": [
+          "discovery"
+        ],
+        "operationId": "runDiscovery",
+        "summary": "Run both scouts in parallel and return their combined report.",
+        "description": "Fans `CatalogScout` and `WebScout` out with `asyncio.gather(..., return_exceptions=True)`, so total latency tracks the slower scout rather than their sum and one failing scout never cancels the other.\n\nWeb results are held back when the catalog returned at least `thin_result_threshold` (default 3) hits, so a healthy catalog result is not buried under external links; the `events` array records that decision. **Render `events` — they are the data behind the agent-activity surface, and error events here are the only way a client can distinguish \"nothing matched\" from \"the provider failed\".**",
+        "x-backs-onto": "agentic_commerce.backend.crew.CommerceCrew.run_discovery",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DiscoveryRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Combined discovery report.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DiscoveryReport"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          }
+        }
+      }
+    },
+    "/api/products/{productId}": {
+      "parameters": [
+        {
+          "name": "productId",
+          "in": "path",
+          "required": true,
+          "description": "The product GID, e.g. `gid://shopify/Product/1234567890`.",
+          "schema": {
+            "type": "string"
+          },
+          "example": "gid://shopify/Product/7234567890123"
+        }
+      ],
+      "get": {
+        "tags": [
+          "discovery"
+        ],
+        "operationId": "getProduct",
+        "summary": "Full product detail, optionally filtered to a chosen variant.",
+        "description": "When `selected` is supplied (e.g. `Color=Black`), the response's `media` is variant-filtered per the UCP spec — this is how the image filmstrip shows the right colourway rather than the default one.",
+        "x-backs-onto": "agentic_commerce.ucp.client.ShopifyUcpClient.get_product",
+        "parameters": [
+          {
+            "name": "selected",
+            "in": "query",
+            "required": false,
+            "description": "Repeatable `name:label` option selections, e.g. `selected=Color:Black&selected=Size:M`.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Product detail.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Product"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "502": {
+            "$ref": "#/components/responses/UpstreamError"
+          }
+        }
+      }
+    },
+    "/api/analysis/best-pick": {
+      "post": {
+        "tags": [
+          "analysis"
+        ],
+        "operationId": "pickBestProduct",
+        "summary": "Rank a result set and name the best fit for a stated need.",
+        "description": "Deterministic scoring — the same products and the same `need` always produce the same verdict, so the UI can explain *why* something won.\n\n**Scoring rules the client must render faithfully:**\n\n- A criterion with no data is dropped and the remaining weights are renormalized. It appears in `missing[]`. It is **not** scored as zero, and must not be drawn as an empty rating.\n- `fabric_fit` is skipped entirely when `need` states no material-relevant trait — pass the shopper's own phrasing, not a bare product name.\n- Prices are compared only within one currency; a product priced in another reports `price_value` under `missing[]` rather than being ranked against it.\n- `caveat` explains that popularity is inferred from review count. The catalog has no purchase-volume field.",
+        "x-backs-onto": "agentic_commerce.backend.crew.CommerceCrew.run_analysis",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BestPickRequest"
+              },
+              "examples": {
+                "statedNeed": {
+                  "summary": "Need phrased in the shopper's words",
+                  "value": {
+                    "session_id": "s_9f2c1a7b4e6d8f01",
+                    "need": "breathable shirt for hot-weather running"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The Analyst's verdict.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BestPick"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "No candidate products — run a search first.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/negotiate": {
+      "post": {
+        "tags": [
+          "negotiation"
+        ],
+        "operationId": "negotiatePrice",
+        "summary": "Negotiate a price via A2A against the merchant agent.",
+        "description": "Runs `RFQ → OFFER → COUNTER…` until `ACCEPT`/`REJECT` or `max_rounds`. The buyer agent enforces `budget_cents` as a hard ceiling and the merchant enforces a private floor, so an agreed price is never above the stated budget. The full `transcript` is returned for audit — surface it behind a disclosure rather than in the main flow.",
+        "x-backs-onto": "agentic_commerce.backend.crew.CommerceCrew.run_negotiation",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NegotiationRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Negotiation outcome and transcript.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NegotiationResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          }
+        }
+      }
+    },
+    "/api/cart": {
+      "post": {
+        "tags": [
+          "checkout"
+        ],
+        "operationId": "createCart",
+        "summary": "Create a Universal Cart on the merchant's Storefront MCP server.",
+        "description": "Discovers the merchant's MCP endpoint via `/.well-known/ucp`, then creates the cart. Only catalog variants are valid here — a `WebResult` has no variant id and cannot be carted.",
+        "x-backs-onto": "agentic_commerce.ucp.client.ShopifyUcpClient.create_cart",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateCartRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Cart created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Cart"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "502": {
+            "$ref": "#/components/responses/UpstreamError"
+          }
+        }
+      }
+    },
+    "/api/cart/{cartId}": {
+      "parameters": [
+        {
+          "name": "cartId",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "merchant_domain",
+          "in": "query",
+          "required": true,
+          "description": "Merchant storefront domain the cart belongs to.",
+          "schema": {
+            "type": "string"
+          },
+          "example": "shop.myshopify.com"
+        }
+      ],
+      "get": {
+        "tags": [
+          "checkout"
+        ],
+        "operationId": "getCart",
+        "summary": "Re-read a cart's current contents and totals.",
+        "x-backs-onto": "agentic_commerce.ucp.client.ShopifyUcpClient.get_cart",
+        "responses": {
+          "200": {
+            "description": "Cart state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Cart"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/api/checkout": {
+      "post": {
+        "tags": [
+          "checkout"
+        ],
+        "operationId": "createCheckout",
+        "summary": "Convert a cart into a checkout session or an attributed referral link.",
+        "description": "Falls back to the merchant's cart permalink when the MCP checkout call is unavailable, so `continue_url` is always populated with something the shopper can open.",
+        "x-backs-onto": "agentic_commerce.ucp.client.ShopifyUcpClient.create_checkout",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateCheckoutRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Checkout session.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Checkout"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "502": {
+            "$ref": "#/components/responses/UpstreamError"
+          }
+        }
+      }
+    },
+    "/api/mandate": {
+      "post": {
+        "tags": [
+          "checkout"
+        ],
+        "operationId": "createMandate",
+        "summary": "Generate a signed AP2 payment authorization mandate.",
+        "description": "Produces an HMAC-SHA256 signed mandate scoped to one cart, one amount, and one expiry. `spending_limit_cents` equals `amount_cents` — the mandate authorizes exactly the cart total and no more. Show the shopper `amount_cents`, `expires_at`, and `status` before they act on it; the `signature` is for verification, not display.",
+        "x-backs-onto": "agentic_commerce.ap2.mandate.AP2Engine.create_payment_mandate",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateMandateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Signed mandate.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Mandate"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          }
+        }
+      }
+    },
+    "/api/payments/test": {
+      "post": {
+        "tags": [
+          "payments"
+        ],
+        "operationId": "processTestPayment",
+        "summary": "Capture a test-mode payment.",
+        "description": "Provider chain: Razorpay if configured, else Stripe, else a simulated gateway. Any provider failure degrades to the simulated gateway so the shopper always gets a receipt.\n\n**Safety guard:** `backend/payments.py` refuses any credential that is not a test key (`rzp_test_*`, `sk_test_*`) and raises `PaymentConfigurationError` rather than transacting on production credentials. An autonomous agent cannot move real money through this endpoint. `live` is therefore always `false` today, but it is on the wire because the client's rendering must depend on the response, not on an assumption.",
+        "x-backs-onto": "agentic_commerce.backend.payments.process_payment",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PaymentRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Payment receipt.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaymentResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Non-positive amount, or a non-test credential was configured.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/telemetry/{sessionId}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/SessionId"
+        }
+      ],
+      "get": {
+        "tags": [
+          "meta"
+        ],
+        "operationId": "getTelemetry",
+        "summary": "Token, tool, and latency stats for the session's latest turn.",
+        "x-backs-onto": "agentic_commerce.core.telemetry.get_latest_session_stats",
+        "responses": {
+          "200": {
+            "description": "Latest turn stats.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TurnStats"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/examples": {
+      "get": {
+        "tags": [
+          "meta"
+        ],
+        "operationId": "listExamples",
+        "summary": "Starter prompts, seeded from the live catalog.",
+        "description": "Hard-coded examples go stale against a live catalog, and a first click that returns nothing is the worst first impression. Prompts are derived from titles the catalog carries now, cached for 10 minutes. `source` distinguishes a live sample (`catalog`) from the canned list used when the catalog is unreachable (`fallback`), so a client can avoid presenting stale suggestions as live ones.",
+        "x-backs-onto": "agentic_commerce.ucp.client.ShopifyUcpClient.search_catalog",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Starter prompts.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "examples",
+                    "source"
+                  ],
+                  "properties": {
+                    "examples": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "source": {
+                      "type": "string",
+                      "enum": [
+                        "catalog",
+                        "fallback"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/mandate/verify": {
+      "post": {
+        "tags": [
+          "payments"
+        ],
+        "operationId": "verifyMandate",
+        "summary": "Re-check a mandate's signature and expiry.",
+        "description": "The client holds a mandate it was handed over the wire; this proves what it is showing is still the authorization the server signed. Expired and tampered are reported as distinct reasons — collapsing them to \"invalid\" tells the shopper nothing about what to do next.",
+        "x-backs-onto": "agentic_commerce.ap2.mandate.AP2Engine.verify_mandate",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Mandate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Verification outcome.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "valid",
+                    "reason"
+                  ],
+                  "properties": {
+                    "valid": {
+                      "type": "boolean"
+                    },
+                    "reason": {
+                      "type": "string",
+                      "description": "Why it passed or failed, in words."
+                    },
+                    "expires_at": {
+                      "type": "integer",
+                      "nullable": true
+                    },
+                    "seconds_remaining": {
+                      "type": "integer",
+                      "nullable": true
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/session": {
+      "post": {
+        "tags": [
+          "session"
+        ],
+        "operationId": "createSession",
+        "summary": "Mint a fresh session.",
+        "description": "Starts a new session and repoints the `ac_session` cookie at it. The previous session is **not** deleted: it stays in the durable store under its own id, so \"start over\" costs the shopper nothing they might want back.",
+        "x-backs-onto": "agentic_commerce.backend.session.new_session_id",
+        "responses": {
+          "201": {
+            "description": "The new session id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "session_id"
+                  ],
+                  "properties": {
+                    "session_id": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/session/{session_id}/graph": {
+      "get": {
+        "tags": [
+          "session"
+        ],
+        "operationId": "getSessionGraph",
+        "summary": "The session as a knowledge graph, for context transfer.",
+        "description": "A transcript or a raw snapshot spends most of its tokens on prose and repeated JSON keys. This states each fact once against a short id (`P1`, `M1`, `C1`) and names the relationships that matter: which merchant sells a product, which cart a mandate authorizes, which mandate a payment settles.\n\n`format=text` returns the line form meant for pasting into a prompt, with a legend so a model that has not seen the format can read it. `format=json` adds the nodes and edges. Token counts are character-based estimates, not a tokenizer's output.\n\nHonesty markers survive the compression: an unrated product carries no rating rather than a zero, a web result is flagged non-purchasable, a payment states `live`, and the Analyst's unscored criteria are listed.",
+        "x-backs-onto": "agentic_commerce.backend.session_graph.build_graph",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "text",
+                "json"
+              ],
+              "default": "text"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The session graph.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "session_id",
+                    "text",
+                    "estimated_tokens"
+                  ],
+                  "properties": {
+                    "session_id": {
+                      "type": "string"
+                    },
+                    "text": {
+                      "type": "string",
+                      "description": "The compact line form."
+                    },
+                    "estimated_tokens": {
+                      "type": "integer"
+                    },
+                    "estimated_tokens_raw_snapshot": {
+                      "type": "integer",
+                      "description": "Same session as a raw snapshot, for comparison."
+                    },
+                    "graph": {
+                      "type": "object",
+                      "description": "Nodes and edges; only when format=json."
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "sessionCookie": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "ac_session",
+        "description": "Opaque session identifier. **This is a capability token**: anyone holding it can read the associated cart, mandate, and payment history. Issue unguessable values, set `HttpOnly`, `SameSite=Lax`, and `Secure` outside local development. Never derive it from anything guessable or user-supplied."
+      }
+    },
+    "parameters": {
+      "SessionId": {
+        "name": "sessionId",
+        "in": "path",
+        "required": true,
+        "description": "Session identifier. Treat as a capability token — see `sessionCookie`.",
+        "schema": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 128
+        },
+        "example": "s_9f2c1a7b4e6d8f01"
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Malformed or invalid request.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "No such resource.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "RateLimited": {
+        "description": "Upstream model or search provider rate limit reached.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "UpstreamError": {
+        "description": "The UCP catalog, merchant MCP server, or search provider failed.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "ServerError": {
+        "description": "Unhandled server error.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "required": [
+          "error",
+          "message"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "Stable machine-readable code.",
+            "examples": [
+              "upstream_unavailable",
+              "no_candidates",
+              "invalid_amount"
+            ]
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable explanation."
+          },
+          "detail": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      },
+      "Health": {
+        "type": "object",
+        "required": [
+          "status",
+          "payment_provider",
+          "web_search_provider"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "degraded"
+            ]
+          },
+          "payment_provider": {
+            "type": "string",
+            "enum": [
+              "razorpay",
+              "stripe",
+              "simulated"
+            ],
+            "description": "Which provider `select_provider()` would choose right now."
+          },
+          "web_search_provider": {
+            "type": "string",
+            "enum": [
+              "tavily",
+              "duckduckgo"
+            ]
+          },
+          "model": {
+            "type": "string"
+          }
+        }
+      },
+      "Money": {
+        "type": "object",
+        "description": "An amount in **minor units** (cents/pence) plus its ISO-4217 currency. Never compare amounts across currencies.",
+        "required": [
+          "amount",
+          "currency"
+        ],
+        "properties": {
+          "amount": {
+            "type": "integer",
+            "description": "Minor units.",
+            "examples": [
+              6500
+            ]
+          },
+          "currency": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 3,
+            "examples": [
+              "USD",
+              "GBP"
+            ]
+          }
+        }
+      },
+      "Media": {
+        "type": "object",
+        "required": [
+          "url"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "default": "image"
+          },
+          "url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "alt_text": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Use as the image `alt`; fall back to the product title when absent."
+          }
+        }
+      },
+      "Rating": {
+        "type": "object",
+        "description": "Present on some products, and on **variants only** for other merchants — clients must check both, as `analyst._rating_of` does. Absence means *not rated*, not badly rated.",
+        "required": [
+          "value"
+        ],
+        "properties": {
+          "value": {
+            "type": "number",
+            "examples": [
+              4.8
+            ]
+          },
+          "scale_min": {
+            "type": "number",
+            "default": 1
+          },
+          "scale_max": {
+            "type": "number",
+            "default": 5
+          },
+          "count": {
+            "type": "integer",
+            "description": "Number of reviews. A popularity proxy only — never a sales figure.",
+            "examples": [
+              42
+            ]
+          }
+        }
+      },
+      "ProductOption": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "examples": [
+              "Color",
+              "Size"
+            ]
+          },
+          "values": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "Availability": {
+        "type": "object",
+        "properties": {
+          "available": {
+            "type": "boolean"
+          }
+        }
+      },
+      "Variant": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "examples": [
+              "gid://shopify/ProductVariant/41590762111059"
+            ]
+          },
+          "title": {
+            "type": "string"
+          },
+          "description": {
+            "$ref": "#/components/schemas/RichText"
+          },
+          "availability": {
+            "$ref": "#/components/schemas/Availability"
+          },
+          "condition": {
+            "type": "string"
+          },
+          "eligible": {
+            "type": "boolean"
+          },
+          "media": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Media"
+            }
+          },
+          "options": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "price": {
+            "$ref": "#/components/schemas/Money"
+          },
+          "rating": {
+            "$ref": "#/components/schemas/Rating"
+          },
+          "seller": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "checkout_url": {
+            "type": "string",
+            "format": "uri"
+          }
+        }
+      },
+      "RichText": {
+        "description": "Either a plain string or a `{plain, html}` object, depending on merchant. Render `plain`; never inject `html` without sanitizing.",
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "plain": {
+                "type": "string"
+              },
+              "html": {
+                "type": "string"
+              }
+            }
+          }
+        ]
+      },
+      "ProductMetadata": {
+        "type": "object",
+        "description": "Merchant-authored copy. `tech_specs` is newline-delimited `Key: Value` pairs and is where the `Fabric:` line lives — parse it with the same logic as `analyst.extract_fabric` rather than writing a second parser.",
+        "properties": {
+          "tech_specs": {
+            "type": "string",
+            "examples": [
+              "Fabric: 100% Cotton\nSleeve Length: Short"
+            ]
+          },
+          "top_features": {
+            "type": "string"
+          },
+          "unique_selling_points": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "Product": {
+        "type": "object",
+        "description": "A Shopify UCP Global Catalog product, passed through unmodified. Purchasable — unlike `WebResult`.",
+        "required": [
+          "id",
+          "title"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "examples": [
+              "gid://shopify/Product/7234567890123"
+            ]
+          },
+          "title": {
+            "type": "string"
+          },
+          "description": {
+            "$ref": "#/components/schemas/RichText"
+          },
+          "media": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Media"
+            }
+          },
+          "variants": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Variant"
+            }
+          },
+          "options": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProductOption"
+            }
+          },
+          "price_range": {
+            "type": "object",
+            "properties": {
+              "min": {
+                "$ref": "#/components/schemas/Money"
+              },
+              "max": {
+                "$ref": "#/components/schemas/Money"
+              }
+            }
+          },
+          "rating": {
+            "$ref": "#/components/schemas/Rating"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/ProductMetadata"
+          }
+        }
+      },
+      "WebResult": {
+        "type": "object",
+        "description": "An open-web listing. **Not purchasable** — it has no variant id and cannot enter a Universal Cart, so clients must render no cart affordance on it at all (absence, not a disabled control).",
+        "required": [
+          "title",
+          "url",
+          "source"
+        ],
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "snippet": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string",
+            "description": "Registrable domain.",
+            "examples": [
+              "nike.com"
+            ]
+          },
+          "image_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uri",
+            "description": "`og:image`/`twitter:image` when discoverable. Frequently `null` — retailer category pages routinely omit it."
+          },
+          "favicon_url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Always populated. When `image_url` is null, render a distinct compact card rather than stretching this icon into a product-image slot."
+          }
+        },
+        "x-purchasable": false
+      },
+      "CrewEvent": {
+        "type": "object",
+        "description": "One progress report from a specialist agent. The unit of the agent-activity surface.",
+        "required": [
+          "agent",
+          "status",
+          "detail"
+        ],
+        "properties": {
+          "agent": {
+            "type": "string",
+            "enum": [
+              "Concierge",
+              "CatalogScout",
+              "WebScout",
+              "Negotiator",
+              "Analyst",
+              "Cashier"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "dispatch",
+              "running",
+              "done",
+              "filter",
+              "error"
+            ],
+            "description": "`filter` records a Concierge decision (e.g. holding web results back); `error` means this specialist failed while others may have succeeded."
+          },
+          "detail": {
+            "type": "string",
+            "description": "One-line human-readable summary."
+          },
+          "duration": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "Seconds elapsed, on terminal events. Render this rather than a progress bar — completion percentage is unknowable."
+          },
+          "payload": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      },
+      "DiscoveryReport": {
+        "type": "object",
+        "required": [
+          "catalog_products",
+          "web_results",
+          "events",
+          "has_catalog_hits"
+        ],
+        "properties": {
+          "catalog_products": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Product"
+            }
+          },
+          "web_results": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WebResult"
+            },
+            "description": "Empty when the catalog returned at least `thin_result_threshold` hits — check `events` for the `filter` record explaining why."
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CrewEvent"
+            }
+          },
+          "has_catalog_hits": {
+            "type": "boolean"
+          }
+        }
+      },
+      "Criterion": {
+        "type": "object",
+        "required": [
+          "name",
+          "score",
+          "weight",
+          "evidence"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "enum": [
+              "rating",
+              "popularity",
+              "fabric_fit",
+              "price_value",
+              "availability"
+            ]
+          },
+          "score": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "weight": {
+            "type": "number",
+            "description": "Renormalized so present criteria sum to 1.0 — not the base weight."
+          },
+          "evidence": {
+            "type": "string",
+            "description": "The literal reason, safe to display verbatim.",
+            "examples": [
+              "4.8/5 rated",
+              "Merino Wool — matches warmth, softness"
+            ]
+          }
+        }
+      },
+      "ProductScore": {
+        "type": "object",
+        "required": [
+          "product_id",
+          "title",
+          "total",
+          "criteria",
+          "missing"
+        ],
+        "properties": {
+          "product_id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "total": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "fabric": {
+            "type": "string"
+          },
+          "price_display": {
+            "type": "string"
+          },
+          "criteria": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Criterion"
+            }
+          },
+          "missing": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Criteria that could not be scored, each with its reason. **Required rendering** — an unscored criterion is unknown, not zero, and hiding this list overstates the verdict's confidence."
+          }
+        }
+      },
+      "BestPick": {
+        "type": "object",
+        "required": [
+          "winner",
+          "ranked",
+          "comparison",
+          "caveat"
+        ],
+        "properties": {
+          "need": {
+            "type": "string",
+            "description": "The shopper's phrasing the verdict was judged against."
+          },
+          "winner": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ProductScore"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Null when there were no candidates."
+          },
+          "ranked": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProductScore"
+            }
+          },
+          "comparison": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Why the winner beat each runner-up, in Markdown."
+          },
+          "caveat": {
+            "type": "string",
+            "description": "Must be surfaced. States that popularity is inferred from review count because the catalog exposes no purchase-volume field.",
+            "examples": [
+              "popularity is inferred from review count; the UCP catalog exposes no purchase-volume field"
+            ]
+          }
+        }
+      },
+      "A2AMessage": {
+        "type": "object",
+        "required": [
+          "message_id",
+          "conversation_id",
+          "performative",
+          "sender",
+          "recipient"
+        ],
+        "properties": {
+          "message_id": {
+            "type": "string"
+          },
+          "conversation_id": {
+            "type": "string"
+          },
+          "performative": {
+            "type": "string",
+            "enum": [
+              "RFQ",
+              "OFFER",
+              "COUNTER",
+              "ACCEPT",
+              "REJECT"
+            ]
+          },
+          "sender": {
+            "type": "string"
+          },
+          "recipient": {
+            "type": "string"
+          },
+          "price_cents": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "price_display": {
+            "type": "string"
+          },
+          "currency": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "timestamp": {
+            "type": "number",
+            "description": "Unix epoch seconds."
+          }
+        }
+      },
+      "NegotiationResult": {
+        "type": "object",
+        "required": [
+          "agreed",
+          "rounds",
+          "transcript"
+        ],
+        "properties": {
+          "agreed": {
+            "type": "boolean"
+          },
+          "final_price_cents": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "final_price_display": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rounds": {
+            "type": "integer"
+          },
+          "savings_cents": {
+            "type": "integer",
+            "description": "How much the agreed price beat the opening offer."
+          },
+          "savings_display": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "transcript": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/A2AMessage"
+            }
+          }
+        }
+      },
+      "PaymentResult": {
+        "type": "object",
+        "required": [
+          "provider",
+          "status",
+          "reference_id",
+          "amount_cents",
+          "currency",
+          "live"
+        ],
+        "properties": {
+          "provider": {
+            "type": "string",
+            "enum": [
+              "razorpay",
+              "stripe",
+              "simulated"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "examples": [
+              "created",
+              "requires_payment_method",
+              "simulated_captured"
+            ]
+          },
+          "reference_id": {
+            "type": "string"
+          },
+          "amount_cents": {
+            "type": "integer"
+          },
+          "amount_display": {
+            "type": "string",
+            "examples": [
+              "1299.00 INR"
+            ]
+          },
+          "currency": {
+            "type": "string"
+          },
+          "live": {
+            "type": "boolean",
+            "description": "Always `false` under the current test-key guard. **Required rendering:** a receipt must visibly state that no real money moved."
+          },
+          "receipt_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uri"
+          }
+        }
+      },
+      "Cart": {
+        "type": "object",
+        "description": "A UCP Universal Cart, passed through from the merchant's MCP server with `merchant_domain` added.",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "merchant_domain": {
+            "type": "string"
+          },
+          "line_items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "totals": {
+            "type": "array",
+            "description": "Typed totals; the displayable one has `type: \"total\"`.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "examples": [
+                    "subtotal",
+                    "tax",
+                    "total"
+                  ]
+                },
+                "amount": {
+                  "type": "integer"
+                },
+                "currency": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "continue_url": {
+            "type": "string",
+            "format": "uri"
+          }
+        }
+      },
+      "Checkout": {
+        "type": "object",
+        "required": [
+          "continue_url"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "continue_url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Always populated — falls back to the merchant cart permalink when MCP checkout is unavailable."
+          },
+          "buyer_email": {
+            "type": "string",
+            "format": "email"
+          },
+          "status": {
+            "type": "string"
+          }
+        }
+      },
+      "Mandate": {
+        "type": "object",
+        "required": [
+          "mandate_id",
+          "cart_id",
+          "amount_cents",
+          "currency",
+          "expires_at",
+          "status",
+          "signature"
+        ],
+        "properties": {
+          "ap2_version": {
+            "type": "string",
+            "examples": [
+              "2026-04-08"
+            ]
+          },
+          "mandate_id": {
+            "type": "string"
+          },
+          "buyer_id": {
+            "type": "string"
+          },
+          "cart_id": {
+            "type": "string"
+          },
+          "merchant_domain": {
+            "type": "string"
+          },
+          "amount_cents": {
+            "type": "integer"
+          },
+          "currency": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "integer",
+            "description": "Unix epoch seconds."
+          },
+          "expires_at": {
+            "type": "integer",
+            "description": "Unix epoch seconds. Show the shopper the remaining validity."
+          },
+          "status": {
+            "type": "string",
+            "examples": [
+              "PENDING"
+            ]
+          },
+          "spending_limit_cents": {
+            "type": "integer",
+            "description": "Equals `amount_cents` — the mandate authorizes the cart total and nothing more."
+          },
+          "signature": {
+            "type": "string",
+            "description": "HMAC-SHA256 over the canonical mandate string. For verification, not display."
+          }
+        }
+      },
+      "TurnStats": {
+        "type": "object",
+        "properties": {
+          "total_tokens": {
+            "type": "integer"
+          },
+          "prompt_tokens": {
+            "type": "integer"
+          },
+          "completion_tokens": {
+            "type": "integer"
+          },
+          "tools_called": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "latency_seconds": {
+            "type": "number"
+          }
+        }
+      },
+      "SessionSnapshot": {
+        "type": "object",
+        "description": "Everything the UI renders outside the transcript. One call rehydrates the whole view.",
+        "required": [
+          "session_id",
+          "last_searched_products",
+          "last_web_results"
+        ],
+        "properties": {
+          "session_id": {
+            "type": "string"
+          },
+          "last_searched_products": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Product"
+            }
+          },
+          "last_web_results": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WebResult"
+            }
+          },
+          "active_product": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Product"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "active_cart": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Cart"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "active_checkout": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Checkout"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "active_mandate": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Mandate"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "active_negotiation": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/NegotiationResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "active_payment": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PaymentResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "best_pick": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/BestPick"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Cleared automatically whenever a new search runs — a stale verdict badged onto fresh results would be worse than none."
+          }
+        }
+      },
+      "ChatRequest": {
+        "type": "object",
+        "required": [
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "type": "string",
+            "minLength": 1
+          },
+          "session_id": {
+            "type": "string",
+            "description": "Omit to have the server mint one; it is returned on the `done` event."
+          },
+          "model": {
+            "type": "string",
+            "description": "Defaults to the `MODEL` environment value."
+          },
+          "temperature": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.4
+          },
+          "system_prompt": {
+            "type": "string",
+            "description": "Overrides the default concierge directives."
+          },
+          "history": {
+            "type": "array",
+            "description": "Prior turns. Omit when the server-side session already holds them.",
+            "items": {
+              "type": "object",
+              "required": [
+                "role",
+                "content"
+              ],
+              "properties": {
+                "role": {
+                  "type": "string",
+                  "enum": [
+                    "user",
+                    "assistant"
+                  ]
+                },
+                "content": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "CatalogSearchRequest": {
+        "type": "object",
+        "required": [
+          "query"
+        ],
+        "properties": {
+          "query": {
+            "type": "string",
+            "minLength": 1
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "price_min": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Minor units."
+          },
+          "price_max": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Minor units."
+          },
+          "ships_to_country": {
+            "type": "string",
+            "default": "US"
+          },
+          "limit": {
+            "type": "integer",
+            "default": 10,
+            "minimum": 1,
+            "maximum": 50
+          }
+        }
+      },
+      "WebSearchRequest": {
+        "type": "object",
+        "required": [
+          "query"
+        ],
+        "properties": {
+          "query": {
+            "type": "string",
+            "minLength": 1
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "integer",
+            "default": 5,
+            "minimum": 1,
+            "maximum": 20
+          },
+          "with_images": {
+            "type": "boolean",
+            "default": true,
+            "description": "Enriches each result with its social preview image. Adds latency bounded by a short per-request timeout."
+          }
+        }
+      },
+      "DiscoveryRequest": {
+        "type": "object",
+        "required": [
+          "query"
+        ],
+        "properties": {
+          "query": {
+            "type": "string",
+            "minLength": 1
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "max_price": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "Major units (dollars), matching the crew's signature."
+          },
+          "limit": {
+            "type": "integer",
+            "default": 5
+          }
+        }
+      },
+      "BestPickRequest": {
+        "type": "object",
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "description": "Scores the session's current results when `products` is omitted."
+          },
+          "products": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Product"
+            },
+            "description": "Explicit candidates, overriding the session's results."
+          },
+          "need": {
+            "type": "string",
+            "description": "The shopper's own phrasing. Fabric fit is skipped when this names no material-relevant trait, so a bare product name weakens the verdict.",
+            "examples": [
+              "breathable shirt for hot-weather running"
+            ]
+          }
+        }
+      },
+      "NegotiationRequest": {
+        "type": "object",
+        "required": [
+          "item",
+          "list_price_cents",
+          "budget_cents"
+        ],
+        "properties": {
+          "item": {
+            "type": "string"
+          },
+          "list_price_cents": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "budget_cents": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Hard ceiling; the buyer agent never agrees above it."
+          },
+          "target_cents": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "merchant_name": {
+            "type": "string",
+            "default": "MerchantAgent"
+          },
+          "tier": {
+            "type": "string",
+            "enum": [
+              "standard",
+              "silver",
+              "gold",
+              "platinum"
+            ],
+            "default": "standard"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        }
+      },
+      "CreateCartRequest": {
+        "type": "object",
+        "required": [
+          "merchant_domain",
+          "variant_id"
+        ],
+        "properties": {
+          "merchant_domain": {
+            "type": "string",
+            "examples": [
+              "shop.myshopify.com"
+            ]
+          },
+          "variant_id": {
+            "type": "string",
+            "examples": [
+              "gid://shopify/ProductVariant/41590762111059"
+            ]
+          },
+          "quantity": {
+            "type": "integer",
+            "default": 1,
+            "minimum": 1
+          },
+          "country": {
+            "type": "string",
+            "default": "US"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        }
+      },
+      "CreateCheckoutRequest": {
+        "type": "object",
+        "required": [
+          "merchant_domain",
+          "cart_id"
+        ],
+        "properties": {
+          "merchant_domain": {
+            "type": "string"
+          },
+          "cart_id": {
+            "type": "string"
+          },
+          "cart_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uri"
+          },
+          "buyer_email": {
+            "type": "string",
+            "format": "email"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        }
+      },
+      "CreateMandateRequest": {
+        "type": "object",
+        "required": [
+          "cart_id",
+          "amount_cents"
+        ],
+        "properties": {
+          "cart_id": {
+            "type": "string"
+          },
+          "amount_cents": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "currency": {
+            "type": "string",
+            "default": "USD"
+          },
+          "merchant_domain": {
+            "type": "string",
+            "default": "shopify.com"
+          },
+          "max_duration_seconds": {
+            "type": "integer",
+            "default": 3600
+          },
+          "buyer_id": {
+            "type": "string",
+            "default": "user_default"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        }
+      },
+      "PaymentRequest": {
+        "type": "object",
+        "required": [
+          "amount_cents"
+        ],
+        "properties": {
+          "amount_cents": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "currency": {
+            "type": "string",
+            "default": "USD"
+          },
+          "receipt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Reference shown on the provider receipt."
+          },
+          "session_id": {
+            "type": "string"
+          }
+        }
+      },
+      "StreamEvent": {
+        "description": "One SSE `data:` payload. Discriminated on `type`.",
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/StatusEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ContentEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ToolCallEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ToolResultEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ProductsEvent"
+          },
+          {
+            "$ref": "#/components/schemas/CrewStreamEvent"
+          },
+          {
+            "$ref": "#/components/schemas/DoneEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ErrorEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ArtifactEvent"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "type",
+          "mapping": {
+            "status": "#/components/schemas/StatusEvent",
+            "content": "#/components/schemas/ContentEvent",
+            "tool_call": "#/components/schemas/ToolCallEvent",
+            "tool_result": "#/components/schemas/ToolResultEvent",
+            "products": "#/components/schemas/ProductsEvent",
+            "crew": "#/components/schemas/CrewStreamEvent",
+            "done": "#/components/schemas/DoneEvent",
+            "error": "#/components/schemas/ErrorEvent",
+            "artifact": "#/components/schemas/ArtifactEvent"
+          }
+        }
+      },
+      "StatusEvent": {
+        "type": "object",
+        "required": [
+          "type",
+          "text"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "status"
+          },
+          "text": {
+            "type": "string",
+            "examples": [
+              "Thinking..."
+            ]
+          }
+        }
+      },
+      "ContentEvent": {
+        "type": "object",
+        "description": "A token delta, not a whole message. Concatenate in arrival order.",
+        "required": [
+          "type",
+          "text"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "content"
+          },
+          "text": {
+            "type": "string"
+          }
+        }
+      },
+      "ToolCallEvent": {
+        "type": "object",
+        "required": [
+          "type",
+          "tool"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "tool_call"
+          },
+          "tool": {
+            "type": "string",
+            "enum": [
+              "search_products",
+              "search_web_products",
+              "pick_best_product",
+              "get_product_details",
+              "negotiate_price",
+              "process_test_payment",
+              "add_to_cart",
+              "checkout_cart",
+              "generate_ap2_mandate"
+            ]
+          },
+          "args": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "text": {
+            "type": "string",
+            "description": "Pre-rendered human-readable label."
+          }
+        }
+      },
+      "ToolResultEvent": {
+        "type": "object",
+        "required": [
+          "type",
+          "tool",
+          "result"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "tool_result"
+          },
+          "tool": {
+            "type": "string"
+          },
+          "result": {
+            "type": "string",
+            "description": "Markdown written for the model to read. Show it behind a log toggle, not as primary UI — the structured equivalents are on the REST endpoints and in the session snapshot."
+          }
+        }
+      },
+      "ProductsEvent": {
+        "type": "object",
+        "required": [
+          "type",
+          "products"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "products"
+          },
+          "products": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Product"
+            }
+          }
+        }
+      },
+      "CrewStreamEvent": {
+        "type": "object",
+        "description": "A `CrewEvent` on the wire. Events from concurrent specialists interleave — route by `agent`, do not infer order.",
+        "required": [
+          "type",
+          "agent",
+          "status",
+          "detail"
+        ],
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/CrewEvent"
+          }
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "crew"
+          }
+        }
+      },
+      "DoneEvent": {
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "done"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "elapsed": {
+            "type": "number",
+            "description": "Wall-clock seconds for the whole turn, measured server-side."
+          },
+          "stats": {
+            "$ref": "#/components/schemas/TurnStats"
+          }
+        }
+      },
+      "ErrorEvent": {
+        "type": "object",
+        "description": "Terminal. The turn produced no further output.",
+        "required": [
+          "type",
+          "error",
+          "message"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "error"
+          },
+          "error": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "ArtifactEvent": {
+        "type": "object",
+        "description": "An object produced by the turn that is worth keeping rather than describing: an AP2 mandate or a payment receipt. Emitted once, at the moment the authorization or charge happens — not on every later turn while it exists. Clients render these inline in the transcript. A `payment` artifact always carries `live`, so the UI can state whether real money moved.",
+        "required": [
+          "type",
+          "kind",
+          "data"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "artifact"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "mandate",
+              "payment"
+            ]
+          },
+          "data": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Mandate"
+              },
+              {
+                "$ref": "#/components/schemas/PaymentResult"
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

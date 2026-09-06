@@ -40,7 +40,17 @@ def stub_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
         async def get_product(self, product_id: str, selected: Any = None) -> dict[str, Any]:
             return FAKE_PRODUCT
 
-    monkeypatch.setattr(tools_mod, "_ucp_client", _StubClient())
+    stub = _StubClient()
+    monkeypatch.setattr(tools_mod, "_ucp_client", stub)
+    # `search_products` reaches the catalog through the crew now, and the crew holds
+    # its own client reference, so stubbing only the module global would let these
+    # tests hit the live catalog.
+    monkeypatch.setattr(tools_mod._crew, "client", stub)
+
+    async def _no_web(*_args: Any, **_kwargs: Any) -> list[Any]:
+        return []
+
+    monkeypatch.setattr("agentic_commerce.backend.crew.search_web", _no_web)
 
 
 def _tool(name: str, session_id: str):

@@ -12,6 +12,10 @@ if _SRC_DIR not in sys.path:
 
 import gradio as gr  # noqa: E402
 
+from agentic_commerce.backend.session import (  # noqa: E402
+    get_or_create_session,
+    new_session_id,
+)
 from agentic_commerce.ui.cards import render_results_panel  # noqa: E402
 from agentic_commerce.ui.chat_engine import (  # noqa: E402
     DEFAULT_MODEL,
@@ -38,13 +42,28 @@ Try one of the example prompts below or type your instruction.
 """
 
 
+def resolve_session_id(stored: str | None) -> str:
+    """Returns the durable session id for this browser, minting one on first visit.
+
+    Gradio's ``request.session_hash`` is deliberately *not* used: it is regenerated on
+    every page load, so keying commerce state on it meant a refresh orphaned the
+    shopper's cart. The id lives in ``gr.BrowserState`` (browser local storage) and is
+    the same capability token the HTTP API issues, so both front doors read one
+    durable session (``backend/session_store.py``).
+    """
+    token = (stored or "").strip()
+    return token or new_session_id()
+
+
 def create_chat_app(chat_engine: ChatEngine | None = None) -> gr.Blocks:
     """Builds and returns the Gradio Blocks app with ChatInterface + product gallery.
 
     Features:
-    - Native dual-stream synchronization using ChatInterface(additional_outputs=[gallery])
+    - Native dual-stream synchronization via
+      ``ChatInterface(additional_outputs=[gallery, results_panel, session_state])``
+    - A durable, browser-stored session id, so a refresh keeps the cart
+    - Results in their own rail rather than competing with the transcript for one column
     - OpenTelemetry observability with live token and latency metrics
-    - Single, clean layout without event storms or duplicate titles
     """
     if chat_engine is None:
         chat_engine = ChatEngine()
@@ -55,26 +74,26 @@ def create_chat_app(chat_engine: ChatEngine | None = None) -> gr.Blocks:
         model_name: str,
         temperature: float,
         system_prompt: str,
+        session_token: str | None,
         request: gr.Request,
-    ) -> Generator[tuple[str, list[tuple[str, str]], str], None, None]:
-        session_id = getattr(request, "session_hash", None) or "default_user_session"
-        yield from chat_engine.stream_with_gallery(
+    ) -> Generator[tuple[str, list[tuple[str, str]], str, str], None, None]:
+        session_id = resolve_session_id(session_token)
+        for chat, gallery_items, panel in chat_engine.stream_with_gallery(
             message=message,
             history=history,
             system_prompt=system_prompt,
             temperature=temperature,
             model_name=model_name,
             session_id=session_id,
-        )
+        ):
+            # The id is echoed back on every chunk so BrowserState persists the one
+            # minted on the first turn.
+            yield chat, gallery_items, panel, session_id
 
-    def clear_gallery_fn(request: gr.Request | None = None) -> tuple[list, str]:
-        from agentic_commerce.backend.session import get_or_create_session
-
-        session_id = getattr(request, "session_hash", None) if request else None
-        session_id = session_id or "default_user_session"
-        session = get_or_create_session(session_id)
-        session.clear_search_results()
-        return [], render_results_panel([], [])
+    def clear_gallery_fn(session_token: str | None = None) -> tuple[list, str, str]:
+        session_id = resolve_session_id(session_token)
+        get_or_create_session(session_id).clear_search_results()
+        return [], render_results_panel([], []), session_id
 
     with gr.Blocks(
         title="Agentic Commerce Hub",
@@ -85,11 +104,13 @@ def create_chat_app(chat_engine: ChatEngine | None = None) -> gr.Blocks:
             "*Autonomous AI Agent Stack (Layer 1 MCP • Layer 2 A2A • Layer 3 AP2)*"
         )
 
+        # Roles are split (§3.2): the results panel is the browsable set, this gallery
+        # is the close-up view of whichever product is active. Column count and height
+        # are left to CSS so the rail reflows instead of forcing a 520px block on a
+        # phone (§3.3).
         gallery = gr.Gallery(
             label="Product Images",
             columns=2,
-            rows=3,
-            height=520,
             object_fit="contain",
             preview=True,
             show_label=False,
@@ -104,6 +125,10 @@ def create_chat_app(chat_engine: ChatEngine | None = None) -> gr.Blocks:
             elem_id="results-panel",
             render=False,
         )
+
+        # Minted on the first turn, then kept in browser local storage so a refresh
+        # returns to the same cart, mandate and negotiation.
+        session_state = gr.BrowserState("", storage_key="ac_session_id")
 
         chatbot = gr.Chatbot(
             height=560,
@@ -139,35 +164,37 @@ def create_chat_app(chat_engine: ChatEngine | None = None) -> gr.Blocks:
             ),
         ]
 
+        # Chat and results no longer share a column (§3.1): the transcript keeps the
+        # left, everything produced by a turn lives in a sticky right rail.
         with gr.Row():
-            with gr.Column(scale=7):
+            with gr.Column(scale=6, min_width=380):
                 gr.ChatInterface(
                     fn=respond,
                     chatbot=chatbot,
                     textbox=textbox,
                     examples=EXAMPLES,
-                    additional_inputs=additional_inputs,
-                    additional_outputs=[gallery, results_panel],
+                    additional_inputs=[*additional_inputs, session_state],
+                    additional_outputs=[gallery, results_panel, session_state],
                     additional_inputs_accordion=gr.Accordion(
                         label="⚙️ Agent & Generation Parameters",
                         open=False,
                     ),
                 )
+            with gr.Column(scale=4, min_width=320, elem_id="results-rail"):
+                gr.Markdown("### 🛍️ Results")
                 results_panel.render()
-            with gr.Column(scale=3, min_width=290):
-                gr.Markdown("### 🖼️ Product Gallery")
+                gr.Markdown("### 🖼️ Close-up")
                 gr.Markdown(
-                    "*Images from `product.media[].url` — click to preview*",
+                    "*Images for the active product — click to open the full-size view*",
                     elem_classes=["gallery-hint"],
                 )
                 gallery.render()
-                gr.Markdown(
-                    "> *Tip: search for products to populate this gallery. "
-                    "Variant-specific images appear when you filter by color.*",
-                    elem_classes=["gallery-help"],
+                clear_btn = gr.Button("Clear results", variant="secondary")
+                clear_btn.click(
+                    fn=clear_gallery_fn,
+                    inputs=[session_state],
+                    outputs=[gallery, results_panel, session_state],
                 )
-                clear_btn = gr.Button("Clear Gallery", variant="secondary")
-                clear_btn.click(fn=clear_gallery_fn, outputs=[gallery, results_panel])
 
                 with gr.Accordion("📊 Telemetry & Observability", open=False):
                     gr.Markdown(
@@ -187,7 +214,10 @@ def launch_chat_app(
     share: bool = False,
     chat_engine: ChatEngine | None = None,
 ) -> None:
-    """Creates and launches the Gradio chat application (theme/CSS applied on the Blocks)."""
+    """Creates the Gradio app and launches it with the custom theme and CSS.
+
+    The theme and CSS are passed to ``.launch()``, not to the ``Blocks`` constructor.
+    """
     app = create_chat_app(chat_engine=chat_engine)
     app.launch(
         server_name=server_name,

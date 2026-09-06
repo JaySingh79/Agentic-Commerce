@@ -1,0 +1,645 @@
+/* Agentic Commerce — a console where several machines shop in parallel.
+ *
+ * The one loud element is the agent timeline; everything else is deliberately
+ * quiet so the timeline reads first. Lime (--live) has exactly two meanings and
+ * appears nowhere else: a specialist is working, and this is the best pick.
+ */
+
+:root {
+  /* Ground is a real hue, not a tinted near-black, so the rail reads as paper
+     under lamplight rather than a terminal. */
+  --ground: #12172b;
+  --panel: #1a2140;
+  --panel-2: #212a4e;
+  --line: #2a3358;
+  --ink: #edeff7;
+  --muted: #939cc4;
+  --live: #c7f25a;
+  --warn: #ff8a7a;
+
+  --s1: 4px;  --s2: 8px;  --s3: 12px; --s4: 16px;
+  --s5: 24px; --s6: 32px; --s7: 48px;
+
+  --t1: 0.72rem; --t2: 0.78rem; --t3: 0.85rem;
+  --t4: 0.95rem; --t5: 1.15rem; --t6: 1.4rem;
+
+  --r1: 6px; --r2: 10px; --r3: 12px; --rp: 999px;
+
+  --sans: "Instrument Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --serif: "Fraunces", ui-serif, Georgia, "Times New Roman", serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+
+  --ease-out: cubic-bezier(0.2, 0, 0, 1);
+  --ease-soft: cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+/* The `hidden` attribute must win over any class that sets `display`.
+   Without this, `.lightbox { display: flex }` (and `.refine`, `.cart`, the
+   result bands) beat the user-agent's `[hidden] { display: none }` on
+   specificity alone, and the page loads with its own modal scrim over it. */
+[hidden] { display: none !important; }
+
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --ground: #f2f3f7;
+    --panel: #ffffff;
+    --panel-2: #f7f8fc;
+    --line: #dfe2ee;
+    --ink: #171c31;
+    --muted: #5c6689;
+    --live: #4f7a05;
+    --warn: #b3341f;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 16px;
+  -webkit-font-smoothing: antialiased;
+}
+
+button, textarea { font: inherit; color: inherit; }
+
+:focus-visible {
+  outline: 2px solid var(--live);
+  outline-offset: 2px;
+  border-radius: var(--r1);
+}
+
+.visually-hidden {
+  position: absolute; width: 1px; height: 1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap;
+}
+
+.skip {
+  position: absolute; left: var(--s4); top: -3rem; z-index: 20;
+  background: var(--panel); color: var(--ink);
+  padding: var(--s2) var(--s4); border-radius: var(--r2);
+  text-decoration: none; transition: top 120ms var(--ease-out);
+}
+.skip:focus { top: var(--s4); }
+
+/* ------------------------------------------------------------- masthead */
+
+.masthead {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: var(--s4);
+  padding: var(--s4) var(--s5);
+  border-bottom: 1px solid var(--line);
+}
+
+.wordmark { font-family: var(--serif); font-size: var(--t5); letter-spacing: -0.01em; }
+.wordmark-a { font-weight: 600; }
+.wordmark-b { font-weight: 400; color: var(--muted); }
+
+.masthead-meta {
+  display: flex; align-items: center; gap: var(--s4);
+  font-size: var(--t2); color: var(--muted);
+}
+
+/* Session controls sit in the masthead rather than the composer: they act on the
+   whole session, not on the next message. */
+.mast-btn {
+  background: none; color: var(--muted);
+  border: 1px solid var(--line); border-radius: var(--r1);
+  padding: var(--s1) var(--s3);
+  font: inherit; font-size: var(--t2); cursor: pointer;
+}
+.mast-btn:hover { color: var(--ink); border-color: var(--muted); }
+.mast-btn:disabled { opacity: 0.6; cursor: progress; }
+.provider::before {
+  content: ""; display: inline-block;
+  width: 6px; height: 6px; border-radius: var(--rp);
+  background: var(--muted); margin-right: var(--s2);
+  vertical-align: 0.1em;
+}
+.provider.ok::before { background: var(--live); }
+
+/* ---------------------------------------------------------------- stage */
+
+.stage {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 420px);
+  gap: 0;
+  height: calc(100% - 61px);
+}
+
+.conversation {
+  display: flex; flex-direction: column; min-width: 0;
+  border-right: 1px solid var(--line);
+}
+
+.transcript {
+  flex: 1; overflow-y: auto; padding: var(--s6) var(--s5) var(--s4);
+  scroll-behavior: smooth;
+}
+
+.transcript > * { max-width: 68ch; }
+
+/* --------------------------------------------------------------- opening */
+
+.opening { padding-top: var(--s6); }
+.opening h1 {
+  font-family: var(--serif);
+  font-size: clamp(1.5rem, 3.2vw, 2.1rem);
+  font-weight: 600; line-height: 1.15;
+  letter-spacing: -0.02em;
+  margin: 0 0 var(--s3);
+}
+.opening p { color: var(--muted); line-height: 1.6; margin: 0 0 var(--s5); max-width: 54ch; }
+
+.starters { display: flex; flex-wrap: wrap; gap: var(--s2); }
+.starter {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--rp); padding: var(--s2) var(--s4);
+  font-size: var(--t3); cursor: pointer;
+  transition: border-color 120ms var(--ease-out), color 120ms var(--ease-out);
+}
+.starter:hover { border-color: var(--muted); }
+
+/* ------------------------------------------------------------------ turns */
+
+.turn { margin-bottom: var(--s6); }
+.turn + .turn { border-top: 1px solid var(--line); padding-top: var(--s5); }
+
+.turn-you {
+  font-size: var(--t5); color: var(--ink); line-height: 1.35;
+  font-family: var(--serif); font-weight: 400;
+  margin-bottom: var(--s4);
+}
+
+/* The answer is rendered Markdown (see renderMarkdown in app.js), so block
+   spacing comes from real elements — `pre-wrap` here would add the source
+   newlines on top of that and double every gap. */
+.answer {
+  font-family: var(--serif);
+  font-size: var(--t4); line-height: 1.7; color: var(--ink);
+  word-wrap: break-word;
+}
+.answer:empty { display: none; }
+.answer > :first-child { margin-top: 0; }
+.answer > :last-child { margin-bottom: 0; }
+.answer p { margin: 0 0 var(--s4); }
+.answer .answer-h {
+  font-family: var(--serif); font-weight: 600;
+  font-size: var(--t5); margin: var(--s5) 0 var(--s2); letter-spacing: -0.01em;
+}
+.answer ul, .answer ol { margin: 0 0 var(--s4); padding-left: var(--s5); }
+.answer li { margin-bottom: var(--s1); }
+.answer li::marker { color: var(--muted); }
+.answer strong { font-weight: 600; }
+.answer a { color: var(--ink); text-decoration: underline; text-underline-offset: 3px; }
+.answer code {
+  font-family: var(--mono); font-size: 0.86em;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--r1); padding: 0 4px;
+}
+.answer pre {
+  font-family: var(--mono); font-size: var(--t2);
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--r2); padding: var(--s3);
+  overflow-x: auto; margin: 0 0 var(--s4);
+}
+.answer pre code { background: none; border: 0; padding: 0; }
+.answer blockquote {
+  margin: 0 0 var(--s4); padding-left: var(--s4);
+  border-left: 2px solid var(--line); color: var(--muted);
+}
+.answer.streaming::after {
+  content: ""; display: inline-block;
+  width: 2px; height: 1em; background: var(--live);
+  margin-left: 2px; vertical-align: -0.15em;
+  animation: caret 1s steps(2) infinite;
+}
+@keyframes caret { 50% { opacity: 0; } }
+
+/* ------------------------------------------------------------- tickets ---
+   A mandate or receipt is an object, not prose, so it gets an object's shape:
+   a stub-edged slip that interrupts the column. Lime is not used here — it means
+   "a specialist is working" and "best pick" elsewhere, and an authorization is
+   neither. */
+
+.ticket {
+  border: 1px solid var(--line);
+  border-left: 3px double var(--muted);
+  border-radius: var(--r2);
+  background: var(--panel);
+  padding: var(--s4);
+  margin: var(--s4) 0 var(--s5);
+  font-family: var(--sans);
+  animation: ticket-in 220ms var(--ease-soft) both;
+}
+@keyframes ticket-in { from { opacity: 0; transform: translateY(6px); } }
+.ticket.expired { opacity: 0.7; border-left-style: dashed; }
+
+.t-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--s3); }
+.t-kind { font-size: var(--t2); letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.t-mode {
+  font-size: var(--t1); letter-spacing: 0.06em;
+  border: 1px solid var(--line); border-radius: var(--rp);
+  padding: 2px var(--s2); color: var(--muted);
+}
+/* If a live charge ever reaches this UI it must not look like the test badge. */
+.t-mode.live { color: var(--warn); border-color: var(--warn); }
+
+.t-amount {
+  font-family: var(--serif); font-size: var(--t6);
+  margin: var(--s2) 0 var(--s3); font-variant-numeric: tabular-nums;
+}
+.t-rows { display: grid; gap: var(--s1); font-size: var(--t3); }
+.t-row { display: flex; gap: var(--s3); align-items: baseline; }
+.t-key { flex: 0 0 5.5rem; color: var(--muted); font-size: var(--t2); }
+.t-val { flex: 1; overflow-wrap: anywhere; }
+.t-val.mono { font-family: var(--mono); font-size: var(--t2); }
+
+.t-clock { margin: var(--s3) 0 0; font-size: var(--t2); color: var(--muted); font-variant-numeric: tabular-nums; }
+.t-clock.gone { color: var(--warn); }
+
+.t-acts { display: flex; flex-wrap: wrap; gap: var(--s2); margin-top: var(--s4); }
+.t-act {
+  background: none; color: var(--ink);
+  border: 1px solid var(--line); border-radius: var(--r1);
+  padding: var(--s2) var(--s3); font: inherit; font-size: var(--t2);
+  cursor: pointer; text-decoration: none;
+}
+.t-act:disabled { opacity: 0.6; cursor: progress; }
+
+.t-verdict { margin: var(--s3) 0 0; font-size: var(--t2); color: var(--muted); }
+.t-verdict.ok { color: var(--live); }
+.t-verdict.bad { color: var(--warn); }
+
+.t-raw { margin-top: var(--s3); }
+.t-raw > summary {
+  cursor: pointer; list-style: none;
+  font-size: var(--t2); color: var(--muted);
+}
+.t-raw > summary::-webkit-details-marker { display: none; }
+.t-raw > summary::after { content: " ▾"; }
+.t-raw[open] > summary::after { content: " ▴"; }
+.t-raw pre {
+  margin: var(--s2) 0 0; padding: var(--s3);
+  background: var(--ground); border: 1px solid var(--line); border-radius: var(--r1);
+  font-family: var(--mono); font-size: var(--t1);
+  max-height: 260px; overflow: auto;
+}
+
+/* ----------------------------------------------- agent timeline (the hero) */
+
+.timeline {
+  margin: 0 0 var(--s4);
+  border-left: 2px solid var(--line);
+  padding-left: var(--s4);
+}
+
+.timeline-summary {
+  display: flex; align-items: center; gap: var(--s2);
+  background: none; border: 0; padding: 0;
+  cursor: pointer; color: var(--muted);
+  font-size: var(--t3); text-align: left;
+}
+.timeline-summary .chev { transition: transform 160ms var(--ease-out); display: inline-block; }
+.timeline[data-open="true"] .timeline-summary .chev { transform: rotate(90deg); }
+.timeline-summary strong { color: var(--ink); font-weight: 500; }
+
+.timeline-rows { display: none; margin-top: var(--s3); }
+.timeline[data-open="true"] .timeline-rows { display: block; }
+
+.step {
+  display: grid;
+  grid-template-columns: 14px 1fr auto;
+  align-items: baseline;
+  gap: var(--s3);
+  padding: var(--s1) 0;
+  font-size: var(--t3);
+  animation: step-in 200ms var(--ease-out) both;
+}
+@keyframes step-in { from { opacity: 0; transform: translateY(3px); } }
+
+.step-mark { color: var(--muted); font-size: var(--t2); line-height: 1.6; }
+.step[data-status="running"] .step-mark { color: var(--live); animation: pulse 1.2s ease-in-out infinite; }
+.step[data-status="done"] .step-mark { color: var(--live); }
+.step[data-status="error"] .step-mark { color: var(--warn); }
+@keyframes pulse { 50% { opacity: 0.35; } }
+
+.step-agent { font-weight: 500; }
+.step-detail { color: var(--muted); }
+.step-time { color: var(--muted); font-size: var(--t2); font-variant-numeric: tabular-nums; }
+.step[data-status="error"] .step-detail { color: var(--warn); }
+
+.step-log {
+  grid-column: 2 / -1;
+  margin: var(--s2) 0 var(--s3);
+  padding: var(--s3);
+  background: var(--panel);
+  border-radius: var(--r1);
+  font-family: var(--mono);
+  font-size: var(--t1);
+  color: var(--muted);
+  white-space: pre-wrap;
+  max-height: 12rem; overflow: auto;
+}
+
+/* ------------------------------------------------------------- composer */
+
+.jump { position: relative; }
+.jump button {
+  position: absolute; bottom: var(--s2); left: 50%; transform: translateX(-50%);
+  background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: var(--rp); padding: var(--s2) var(--s4);
+  font-size: var(--t2); cursor: pointer; color: var(--muted);
+}
+
+.composer {
+  display: flex; align-items: flex-end; gap: var(--s3);
+  padding: var(--s4) var(--s5) var(--s5);
+  border-top: 1px solid var(--line);
+}
+
+.composer textarea {
+  flex: 1; resize: none; max-height: 9rem;
+  background: var(--panel); color: var(--ink);
+  border: 1px solid var(--line); border-radius: var(--r3);
+  padding: var(--s3) var(--s4); line-height: 1.5;
+  font-size: var(--t4);
+}
+.composer textarea::placeholder { color: var(--muted); }
+.composer textarea:focus { border-color: var(--muted); outline: none; }
+
+.send, .stop {
+  border: 1px solid var(--line); border-radius: var(--r3);
+  padding: var(--s3) var(--s5); cursor: pointer;
+  background: var(--panel-2);
+  transition: border-color 120ms var(--ease-out);
+}
+.send:hover, .stop:hover { border-color: var(--muted); }
+.send[disabled] { opacity: 0.45; cursor: default; }
+
+/* ------------------------------------------------------------------ rail */
+
+.rail { overflow-y: auto; padding: var(--s5); background: var(--ground); }
+
+.rail-empty { color: var(--muted); font-size: var(--t3); line-height: 1.6; max-width: 34ch; }
+
+.notice {
+  border: 1px solid var(--warn);
+  border-radius: var(--r2);
+  padding: var(--s3) var(--s4);
+  margin-bottom: var(--s5);
+  font-size: var(--t3);
+  color: var(--warn);
+}
+
+/* Cart: the thing being bought stays visible, above the things that might be.
+   It sits outside the result bands so a new search never scrolls it away. */
+.cart {
+  border: 1px solid var(--live);
+  border-radius: var(--r2);
+  padding: var(--s3) var(--s4);
+  margin-bottom: var(--s5);
+}
+.cart-body { display: grid; gap: var(--s1); font-size: var(--t3); }
+.cart-item { margin: 0; }
+.cart-total { margin: 0; font-variant-numeric: tabular-nums; font-weight: 600; }
+.cart-merchant { margin: 0; color: var(--muted); font-size: var(--t2); }
+.cart-continue {
+  margin-top: var(--s2); font-size: var(--t2); color: var(--ink);
+  text-decoration: underline; text-underline-offset: 3px;
+}
+
+/* Refinement: price re-runs the scouts, sort is local. Kept plain and small —
+   it is a control strip, not a second search box. */
+.refine {
+  display: flex; flex-wrap: wrap; align-items: end; gap: var(--s3);
+  margin-bottom: var(--s5); padding-bottom: var(--s4);
+  border-bottom: 1px solid var(--line);
+}
+.refine-field { display: grid; gap: var(--s1); font-size: var(--t2); color: var(--muted); }
+.refine-field input, .refine-field select {
+  background: var(--panel); color: var(--ink);
+  border: 1px solid var(--line); border-radius: var(--r1);
+  padding: var(--s2); font: inherit; font-size: var(--t3); min-width: 7rem;
+}
+#refine-run {
+  background: var(--panel); color: var(--ink);
+  border: 1px solid var(--line); border-radius: var(--r1);
+  padding: var(--s2) var(--s4); font: inherit; font-size: var(--t3); cursor: pointer;
+}
+#refine-run:disabled { opacity: 0.5; cursor: progress; }
+.refine-note { flex: 1 0 100%; margin: 0; color: var(--muted); font-size: var(--t2); }
+
+.band + .band { margin-top: var(--s6); }
+.band-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--s3); }
+.band-head h2 {
+  font-family: var(--serif); font-size: var(--t5);
+  font-weight: 600; margin: 0 0 var(--s3); letter-spacing: -0.01em;
+}
+.band-note { color: var(--muted); font-size: var(--t2); }
+.band-toggle {
+  background: none; border: 0; color: var(--muted);
+  font-size: var(--t2); cursor: pointer; padding: 0;
+  text-decoration: underline; text-underline-offset: 3px;
+}
+.band-caveat { color: var(--muted); font-size: var(--t2); margin: 0 0 var(--s3); max-width: 40ch; }
+
+/* Catalog: tall, image-dominant cards. */
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: var(--s3);
+}
+
+.card {
+  position: relative;
+  display: flex; flex-direction: column;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r3);
+  overflow: hidden;
+  animation: card-in 200ms var(--ease-out) both;
+  animation-delay: var(--delay, 0ms);
+  transition: border-color 120ms var(--ease-out), transform 120ms var(--ease-out);
+}
+.card:hover { transform: translateY(-2px); border-color: var(--muted); }
+@keyframes card-in { from { opacity: 0; transform: translateY(6px); } }
+
+.card.best { border-color: var(--live); }
+.ribbon {
+  position: absolute; z-index: 2; top: var(--s2); left: var(--s2);
+  background: var(--live); color: #12172b;
+  font-size: var(--t1); font-weight: 600;
+  padding: 2px 8px; border-radius: var(--rp);
+  animation: ribbon-in 200ms var(--ease-out) both;
+}
+@keyframes ribbon-in { from { opacity: 0; transform: scale(0.9); } }
+
+/* Filmstrip: slots are reserved at 1:1 before any image loads, so nothing shifts. */
+.film {
+  display: flex; overflow-x: auto; scroll-snap-type: x mandatory;
+  scrollbar-width: none; background: var(--panel-2);
+}
+.film::-webkit-scrollbar { display: none; }
+.film figure { flex: 0 0 100%; margin: 0; scroll-snap-align: center; }
+.film .slot {
+  aspect-ratio: 1 / 1; width: 100%;
+  background: var(--panel-2);
+  display: flex; align-items: center; justify-content: center;
+}
+.film img {
+  width: 100%; height: 100%; object-fit: contain; display: block;
+  opacity: 0; transition: opacity 200ms var(--ease-out);
+}
+.film img.loaded { opacity: 1; }
+.film .absent { color: var(--muted); font-size: var(--t1); }
+
+.dots { display: flex; gap: var(--s1); justify-content: center; padding: var(--s2) 0 0; }
+.dot {
+  width: 5px; height: 5px; padding: 0; border: 0; border-radius: var(--rp);
+  background: var(--line); cursor: pointer;
+}
+.dot[aria-current="true"] { background: var(--muted); }
+
+.card-body { padding: var(--s3); display: flex; flex-direction: column; gap: var(--s1); }
+.card-title {
+  font-family: var(--serif); font-size: var(--t3); font-weight: 600;
+  line-height: 1.25; margin: 0;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.card-line { display: flex; align-items: baseline; justify-content: space-between; gap: var(--s2); }
+.price { font-size: var(--t3); font-variant-numeric: tabular-nums; }
+.signal { font-size: var(--t1); color: var(--muted); text-align: right; }
+
+.more { border-top: 1px solid var(--line); font-size: var(--t2); }
+.more > summary {
+  cursor: pointer; padding: var(--s2) var(--s3);
+  color: var(--muted); list-style: none;
+}
+.more > summary::-webkit-details-marker { display: none; }
+.more > summary::after { content: " ▾"; }
+.more[open] > summary::after { content: " ▴"; }
+.specs { margin: 0; padding: 0 var(--s3) var(--s3); display: grid; gap: var(--s1); }
+.spec { display: flex; gap: var(--s2); align-items: baseline; }
+.spec dt { flex: 0 0 4.5rem; color: var(--muted); margin: 0; }
+.spec dd { margin: 0; flex: 1; overflow-wrap: anywhere; }
+/* Card actions. Present only where the action is real: a web listing has no
+   cart control at all, and an out-of-stock variant says so instead of offering a
+   dead button. */
+.actions { display: grid; gap: var(--s2); margin: var(--s2) var(--s3) var(--s3); }
+.add, .why {
+  background: none; border: 1px solid var(--line); border-radius: var(--r1);
+  padding: var(--s2); width: 100%;
+  font: inherit; font-size: var(--t2); cursor: pointer; color: var(--muted);
+}
+.add { color: var(--ink); border-color: var(--live); }
+.add:disabled { cursor: default; opacity: 0.7; border-color: var(--line); }
+.unavailable { font-size: var(--t2); color: var(--muted); }
+
+/* Web: wide, text-first rows. A different silhouette, not a restyled card,
+   because these cannot be bought here and should not look like they can. */
+.rows { display: flex; flex-direction: column; gap: var(--s2); }
+.row {
+  display: grid; grid-template-columns: 44px 1fr; gap: var(--s3);
+  align-items: start;
+  padding: var(--s3);
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--muted);
+  border-radius: 0 var(--r2) var(--r2) 0;
+  text-decoration: none; color: inherit;
+  background: var(--panel);
+  transition: border-left-color 120ms var(--ease-out);
+}
+.row:hover { border-left-color: var(--ink); }
+.row-thumb {
+  width: 44px; height: 44px; border-radius: var(--r1);
+  object-fit: cover; background: var(--panel-2);
+}
+.row-thumb.icon { object-fit: contain; padding: 10px; }
+.row-title { font-size: var(--t3); line-height: 1.3; margin: 0 0 2px; }
+.row-source { font-size: var(--t1); color: var(--muted); }
+.row-snippet {
+  font-size: var(--t2); color: var(--muted); margin: var(--s1) 0 0;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+
+/* --------------------------------------------------------------- drawer */
+
+.drawer-scrim {
+  position: fixed; inset: 0; background: rgba(6, 9, 20, 0.55); z-index: 30;
+  animation: fade 160ms var(--ease-out);
+}
+@keyframes fade { from { opacity: 0; } }
+
+.drawer {
+  position: fixed; top: 0; right: 0; bottom: 0; z-index: 31;
+  width: min(560px, 92vw);
+  background: var(--panel);
+  border-left: 1px solid var(--line);
+  padding: var(--s5);
+  overflow-y: auto;
+  animation: slide 240ms var(--ease-soft);
+}
+@keyframes slide { from { transform: translateX(24px); opacity: 0; } }
+
+.drawer-head { display: flex; align-items: baseline; justify-content: space-between; }
+.drawer-head h2 { font-family: var(--serif); font-size: var(--t6); margin: 0 0 var(--s4); }
+.drawer-close { background: none; border: 0; color: var(--muted); cursor: pointer; }
+
+.verdict { font-size: var(--t3); line-height: 1.6; }
+.verdict h3 { font-family: var(--serif); font-size: var(--t5); margin: 0 0 var(--s2); }
+.verdict table { width: 100%; border-collapse: collapse; margin: var(--s4) 0; }
+.verdict th, .verdict td {
+  text-align: left; padding: var(--s2) var(--s2) var(--s2) 0;
+  border-bottom: 1px solid var(--line); vertical-align: top;
+}
+.verdict th { color: var(--muted); font-weight: 500; width: 8rem; }
+.verdict .score { font-variant-numeric: tabular-nums; color: var(--muted); }
+.unscored { color: var(--muted); border: 1px dashed var(--line); border-radius: var(--r2); padding: var(--s3); }
+.unscored strong { color: var(--ink); font-weight: 500; }
+.caveat { color: var(--muted); font-size: var(--t2); margin-top: var(--s4); }
+
+/* ------------------------------------------------------------- lightbox */
+
+.lightbox {
+  position: fixed; inset: 0; z-index: 40;
+  background: rgba(6, 9, 20, 0.9);
+  display: flex; align-items: center; justify-content: center;
+  animation: fade 160ms var(--ease-out);
+}
+.lightbox img { max-width: 90vw; max-height: 86vh; object-fit: contain; }
+.lightbox-close {
+  position: absolute; top: var(--s5); right: var(--s5);
+  background: none; border: 0; color: var(--ink); cursor: pointer;
+}
+
+/* ----------------------------------------------------------- responsive */
+
+@media (max-width: 1024px) {
+  .stage { grid-template-columns: 1fr; height: auto; }
+  .conversation { border-right: 0; }
+  .rail { border-top: 1px solid var(--line); }
+  .transcript { max-height: 60vh; }
+}
+
+@media (max-width: 640px) {
+  .masthead { flex-direction: column; align-items: flex-start; gap: var(--s2); }
+  .transcript, .composer, .rail { padding-left: var(--s4); padding-right: var(--s4); }
+}
+
+/* Reduced motion is honoured, not merely acknowledged: opacity only, and no
+   smooth scrolling that would move the page under someone's eyes. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+  .card:hover { transform: none; }
+  .film { scroll-behavior: auto; }
+}

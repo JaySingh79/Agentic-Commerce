@@ -65,3 +65,6 @@ agents/
 
 # Keep watcher parity
 coverage/
+
+# Durable session snapshots (backend/session_store.py)
+.agentic_commerce/

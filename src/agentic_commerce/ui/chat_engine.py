@@ -100,26 +100,56 @@ def _media_for(product: dict[str, Any]) -> list[dict[str, str]]:
 def get_gallery_items(session: CommerceSession) -> list[tuple[str, str]]:
     """Builds (image_url, caption) pairs for gr.Gallery from session state.
 
-    Prefers ``active_product`` when set (detail view), otherwise falls back to
-    ``last_searched_products``. Captions include title + price.
+    The two product surfaces have distinct jobs (§3.2). The results panel
+    (``ui/cards.py``) is the *browsable set*: one card per match. This gallery is
+    the *close-up*: when a product is active it shows every image that product
+    has, so the shopper can actually look at it, instead of repeating the grid
+    one thumbnail at a time.
+
+    With no catalog matches it falls back to web listing imagery (§3.4) rather
+    than sitting empty next to a rail full of web results; those captions name
+    their source, because a web photo is not a catalog product.
     """
-    products = []
     if session.active_product and _media_for(session.active_product):
-        products = [session.active_product]
-    elif session.last_searched_products:
-        products = session.last_searched_products[:6]
+        return _images_of(session.active_product, limit=8)
+
+    if session.last_searched_products:
+        items: list[tuple[str, str]] = []
+        for product in session.last_searched_products[:6]:
+            items.extend(_images_of(product, limit=1))
+        return items
+
+    return _web_gallery_items(session.last_web_results)
+
+
+def _images_of(product: dict[str, Any], limit: int) -> list[tuple[str, str]]:
+    """Up to *limit* (url, caption) pairs for one product."""
+    price = _price_str(product)
+    title = str(product.get("title", "Product"))
+    caption = f"{title} — {price}" if price else title
     items: list[tuple[str, str]] = []
-    for p in products:
-        for m in _media_for(p):
-            if m.get("type") != "image":
-                continue
-            url = m["url"]
-            price = _price_str(p)
-            caption = f"{p.get('title','Product')} — {price}" if price else str(  # noqa: E501
-                p.get("title", "Product")
-            )
-            items.append((url, caption))
-            break  # one preview per product
+    for medium in _media_for(product):
+        if medium.get("type") != "image":
+            continue
+        items.append((medium["url"], caption))
+        if len(items) >= limit:
+            break
+    return items
+
+
+def _web_gallery_items(results: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    """Gallery entries for web listings, favicons excluded.
+
+    A favicon is site branding, not the product, and putting them in a preview
+    gallery says "here is what you would buy" about a 128px logo.
+    """
+    items: list[tuple[str, str]] = []
+    for result in results[:6]:
+        url = result.get("image_url")
+        if not url:
+            continue
+        source = str(result.get("source") or "web")
+        items.append((str(url), f"{result.get('title', 'Listing')} — {source}"))
     return items
 
 
@@ -310,8 +340,24 @@ class ChatEngine:
                 parts.append(answer)
             return "\n\n".join(parts) or "…"
 
+        # The panel is re-emitted on every streamed token, but products cannot change
+        # mid-sentence. Rebuilding (and re-escaping) every card per token was the source
+        # of the grid flicker, so the HTML is cached against a cheap identity signature
+        # and only rebuilt when the underlying results actually change.
+        panel_cache: dict[str, str] = {}
+
         def render_panel() -> str:
-            return render_results_panel(products, session.last_web_results)
+            signature = (
+                f"{len(products)}:{id(products)}:"
+                f"{len(session.last_web_results)}:{id(session.last_web_results)}:"
+                f"{id(session.best_pick)}"
+            )
+            if signature not in panel_cache:
+                panel_cache.clear()
+                panel_cache[signature] = render_results_panel(
+                    products, session.last_web_results, session.best_pick
+                )
+            return panel_cache[signature]
 
         yield render_chat(), gallery, render_panel()
 
@@ -326,7 +372,12 @@ class ChatEngine:
                 yield render_chat(), gallery, render_panel()
             elif etype == "tool_result":
                 tool = event.get("tool")
-                if tool in {"search_products", "get_product_details"}:
+                if tool in {
+                    "search_products",
+                    "get_product_details",
+                    "pick_best_product",
+                    "search_web_products",
+                }:
                     gallery = get_gallery_items(session)
                     products = _serialize_products(
                         [session.active_product]

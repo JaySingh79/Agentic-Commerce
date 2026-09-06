@@ -33,6 +33,11 @@ the web', a niche brand), call `search_web_products`. Always say when results ca
 open web and note that those listings cannot be added to a Universal Cart.
 4. Product Details: Call `get_product_details` when the user asks about specific details
 or materials.
+4b. Best Pick (Analyst): When the shopper asks which one to buy, which is best, or to
+compare the results, call `pick_best_product` and pass their need in their own words (e.g.
+'breathable shirt for hot-weather running'). The Analyst scores rating, review volume, fabric
+fit against that need, price against the other results, and availability. Report its reasoning
+and its stated gaps; never claim sales figures — the catalog has none.
 5. Cart & Checkout: Call `add_to_cart` when the user chooses an item, and offer to prepare checkout
 with `checkout_cart` or generate an AP2 mandate with `generate_ap2_mandate`.
 6. Price Negotiation (A2A): If the shopper says a price is too high, asks for a discount, or gives a
@@ -44,7 +49,8 @@ imply real money moved.
 8. Multi-turn Continuity: Always remember previously discussed items, active carts, and preferences.
 
 You coordinate a crew: you talk to the shopper while specialist agents (CatalogScout, WebScout,
-Negotiator, Cashier) work in the background. Mention what the crew is doing when it is useful.
+Negotiator, Analyst, Cashier) work in the background. Mention what the crew is doing when
+it is useful.
 """
 
 
@@ -243,6 +249,8 @@ class CommerceAgent:
                         delta = extract_text_content(chunk.content)
                         if delta:
                             first_text += delta
+                            # Must be `yield`: a `return` here ends the generator on the
+                            # first token, dropping the answer and skipping tool execution.
                             yield {"type": "content", "text": delta}
 
                     usage = getattr(ai_msg, "usage_metadata", None) or {}
@@ -267,7 +275,7 @@ class CommerceAgent:
                     for tc in tool_calls:
                         tname = tc.get("name", "")
                         targs = tc.get("args", {})
-                        yield {
+                        yield {                
                             "type": "tool_call",
                             "tool": tname,
                             "args": targs,
@@ -356,7 +364,7 @@ class CommerceAgent:
 
             if target_product:
                 title = target_product.get("title", "Product")
-                yield {
+                yield {                           
                     "type": "tool_call",
                     "tool": "get_product_details",
                     "text": f"Fetching details for {title}...",

@@ -153,3 +153,86 @@ def test_clear_search_results_empties_every_gallery_source():
     assert session.active_product is None
     assert session.last_web_results == []
     assert get_gallery_items(session) == []
+
+
+# --------------------------------------------------------------- layout (§3)
+
+
+def _product(pid: str, images: int) -> dict:
+    return {
+        "id": pid,
+        "title": f"Product {pid}",
+        "media": [
+            {"url": f"https://cdn.example/{pid}-{i}.jpg", "type": "image"} for i in range(images)
+        ],
+    }
+
+
+def test_the_gallery_shows_every_image_of_the_active_product():
+    """The close-up view is the gallery's job; the grid already lists the set."""
+    from agentic_commerce.ui.chat_engine import get_gallery_items
+
+    session = get_or_create_session("ui_gallery_active")
+    session.update_search_results([_product("a", 2), _product("b", 2)])
+    session.update_active_product(_product("a", 3))
+
+    items = get_gallery_items(session)
+
+    assert [url for url, _ in items] == [
+        "https://cdn.example/a-0.jpg",
+        "https://cdn.example/a-1.jpg",
+        "https://cdn.example/a-2.jpg",
+    ]
+
+
+def test_without_an_active_product_the_gallery_shows_one_image_per_match():
+    from agentic_commerce.ui.chat_engine import get_gallery_items
+
+    session = get_or_create_session("ui_gallery_browse")
+    session.clear_search_results()
+    session.update_search_results([_product("a", 3), _product("b", 3)])
+
+    items = get_gallery_items(session)
+
+    assert [url for url, _ in items] == [
+        "https://cdn.example/a-0.jpg",
+        "https://cdn.example/b-0.jpg",
+    ]
+
+
+def test_web_imagery_reaches_the_gallery_when_the_catalog_is_empty():
+    from agentic_commerce.ui.chat_engine import get_gallery_items
+
+    session = get_or_create_session("ui_gallery_web")
+    session.clear_search_results()
+    session.update_web_results([
+        {
+            "title": "Trail Runner",
+            "url": "https://shop.example/x",
+            "source": "shop.example",
+            "image_url": "https://shop.example/x.jpg",
+        },
+        # Favicon-only: site branding, not the product.
+        {
+            "title": "Category page",
+            "url": "https://other.example/c",
+            "source": "other.example",
+            "image_url": None,
+            "favicon_url": "https://icons.example/f.png",
+        },
+    ])
+
+    items = get_gallery_items(session)
+
+    assert [url for url, _ in items] == ["https://shop.example/x.jpg"]
+    assert "shop.example" in items[0][1]
+
+
+def test_a_web_search_refreshes_the_gallery():
+    """`search_web_products` used to be skipped, so web images never appeared."""
+    import inspect
+
+    from agentic_commerce.ui import chat_engine
+
+    source = inspect.getsource(chat_engine.ChatEngine.stream_with_gallery)
+    assert "search_web_products" in source

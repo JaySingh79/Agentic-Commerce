@@ -216,3 +216,56 @@ def test_serialization_round_trips_for_the_ui():
     assert payload["winner"]["product_id"] == "a"
     assert payload["winner"]["criteria"]
     assert isinstance(payload["ranked"], list)
+
+
+def test_tool_is_registered_and_writes_the_verdict_to_its_session():
+    """End to end through the tool layer, without an LLM in the loop."""
+    from agentic_commerce.backend.session import get_or_create_session
+    from agentic_commerce.backend.tools import make_commerce_tools
+    from agentic_commerce.ui.cards import render_results_panel
+
+    session_id = "analyst_tool_session"
+    session = get_or_create_session(session_id)
+    session.update_search_results(
+        [
+            product("gid://a", "Cotton tee", rating=4.2, count=30, specs=COTTON, amount=4000),
+            product("gid://b", "Tech tee", rating=4.7, count=90, specs=POLY, amount=3600),
+        ]
+    )
+
+    tools = {t.name: t for t in make_commerce_tools(session_id)}
+    assert "pick_best_product" in tools
+
+    out = tools["pick_best_product"].invoke({"need": "moisture wicking shirt for running"})
+
+    assert "Best pick: Tech tee" in out
+    assert session.best_pick["winner"]["product_id"] == "gid://b"
+
+    # The verdict reaches the UI panel as a ribbon on the winning card.
+    panel = render_results_panel(session.last_searched_products, [], session.best_pick)
+    assert "ac-card-best" in panel
+    assert panel.count("ac-card-ribbon") == 1
+
+
+def test_tool_says_so_when_there_is_nothing_to_compare():
+    from agentic_commerce.backend.session import get_or_create_session
+    from agentic_commerce.backend.tools import make_commerce_tools
+
+    session_id = "analyst_empty_session"
+    get_or_create_session(session_id).clear_search_results()
+    tools = {t.name: t for t in make_commerce_tools(session_id)}
+
+    assert "search_products" in tools["pick_best_product"].invoke({"need": "anything"})
+
+
+def test_a_new_search_invalidates_the_previous_verdict():
+    """A stale 'best pick' badge on fresh results is worse than none."""
+    from agentic_commerce.backend.session import get_or_create_session
+
+    session = get_or_create_session("analyst_staleness_session")
+    session.update_search_results([product("gid://a", "Alpha", rating=4.5, count=10)])
+    session.update_best_pick({"winner": {"product_id": "gid://a"}})
+
+    session.update_search_results([product("gid://z", "Zulu", rating=4.5, count=10)])
+
+    assert session.best_pick is None

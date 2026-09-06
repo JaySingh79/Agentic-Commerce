@@ -82,7 +82,7 @@ footer { visibility: hidden !important; }
 .ac-card {
     display: flex;
     flex-direction: column;
-    text-decoration: none !important;
+    position: relative;
     color: inherit !important;
     background: rgba(17, 24, 39, 0.55);
     border: 1px solid rgba(255, 255, 255, 0.08);
@@ -93,6 +93,20 @@ footer { visibility: hidden !important; }
 .ac-card:hover {
     transform: translateY(-2px);
     border-color: rgba(99, 102, 241, 0.6);
+}
+/* Favicon-only web listings (§5.1). A 128px favicon stretched into a square
+   photo slot is what made the web grid look ragged, so results with no real
+   image get a deliberately different, compact silhouette: short letterboxed
+   strip, icon shown at its own size, never upscaled. */
+.ac-card-compact .ac-card-media {
+    aspect-ratio: 5 / 2;
+    background: #0b1120;
+}
+.ac-card-compact .ac-card-media img {
+    width: auto;
+    height: 44px;
+    max-height: 44px;
+    object-fit: contain;
 }
 .ac-card-media {
     aspect-ratio: 1 / 1;
@@ -129,6 +143,64 @@ footer { visibility: hidden !important; }
     border: 1px solid rgba(99, 102, 241, 0.35);
     opacity: 0.9;
 }
+/* The clickable region is the anchor *inside* the card, so the <details>
+   disclosure below it can be interactive without nesting a control in a link. */
+.ac-card-link {
+    display: flex;
+    flex-direction: column;
+    text-decoration: none !important;
+    color: inherit !important;
+    flex: 1;
+}
+.ac-card-more {
+    border-top: 1px solid rgba(255, 255, 255, 0.07);
+    font-size: 0.76rem;
+}
+.ac-card-more > summary {
+    cursor: pointer;
+    padding: 5px 10px;
+    opacity: 0.75;
+    list-style: none;
+    user-select: none;
+}
+.ac-card-more > summary::-webkit-details-marker { display: none; }
+.ac-card-more > summary::after {
+    content: " BE";
+    opacity: 0.6;
+}
+.ac-card-more[open] > summary::after { content: " B4"; }
+.ac-card-more > summary:hover { opacity: 1; }
+.ac-card-more > summary:focus-visible {
+    outline: 2px solid rgba(99, 102, 241, 0.9);
+    outline-offset: -2px;
+}
+.ac-detail-list {
+    padding: 2px 10px 9px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+.ac-detail-row { display: flex; gap: 6px; align-items: baseline; }
+.ac-detail-key {
+    flex: 0 0 auto;
+    opacity: 0.6;
+    min-width: 62px;
+}
+.ac-detail-val { flex: 1; opacity: 0.92; overflow-wrap: anywhere; }
+/* Analyst's verdict, rendered on the product rather than only in the chat. */
+.ac-card-best { border-color: rgba(234, 179, 8, 0.65); }
+.ac-card-ribbon {
+    position: absolute;
+    top: 6px;
+    left: 6px;
+    z-index: 2;
+    font-size: 0.66rem;
+    font-weight: 600;
+    padding: 2px 7px;
+    border-radius: 999px;
+    background: rgba(234, 179, 8, 0.92);
+    color: #1f2937;
+}
 .ac-empty { opacity: 0.55; font-size: 0.88rem; padding: 10px 2px; }
 /* Telemetry badge in chat */
 .message-row blockquote {
@@ -138,12 +210,36 @@ footer { visibility: hidden !important; }
     border-radius: 6px;
     font-size: 0.88rem !important;
 }
-/* Product gallery styling */
+/* ---------------- Results rail (§3.1) -------------------------------------
+   Results get their own column and follow the reader down it, so scrolling the
+   transcript never scrolls the products out of reach. The rail falls back to
+   normal flow on short viewports, where sticky would pin a taller-than-screen
+   block and trap the scroll. */
+#results-rail {
+    position: sticky;
+    top: 8px;
+    align-self: flex-start;
+    max-height: calc(100vh - 24px);
+    overflow-y: auto;
+    scrollbar-width: thin;
+}
+@media (max-width: 860px), (max-height: 620px) {
+    #results-rail {
+        position: static;
+        max-height: none;
+        overflow-y: visible;
+    }
+}
+
+/* Product gallery styling. Height is viewport-relative rather than a fixed
+   520px block, so the close-up view shrinks with the rail instead of forcing
+   the page to scroll on a laptop (§3.3). */
 #product-gallery {
     border: 1px solid rgba(255,255,255,0.08);
     border-radius: 14px;
     overflow: hidden;
     background: rgba(17,24,39,0.5);
+    max-height: min(46vh, 420px);
 }
 #product-gallery .gallery-item img {
     border-radius: 10px;

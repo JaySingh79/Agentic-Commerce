@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agentic Commerce</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600&family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<a class="skip" href="#composer">Skip to the message box</a>
+
+<header class="masthead">
+  <div class="wordmark">
+    <span class="wordmark-a">Agentic</span>
+    <span class="wordmark-b">Commerce</span>
+  </div>
+  <div class="masthead-meta">
+    <span class="provider" id="provider-payments">payments checking</span>
+    <span class="provider" id="provider-search">search checking</span>
+    <button type="button" class="mast-btn" id="copy-context"
+            title="Copy this session as a compact graph for another agent">Copy context</button>
+    <button type="button" class="mast-btn" id="new-session"
+            title="Start a fresh session; this one is kept">New session</button>
+  </div>
+</header>
+
+<main class="stage">
+  <!-- Conversation -->
+  <section class="conversation" aria-label="Conversation">
+    <div class="transcript" id="transcript">
+      <div class="opening" id="opening">
+        <h1>Ask for something. Several agents go looking at once.</h1>
+        <p>
+          One searches the Shopify catalog, another searches the open web, and an
+          analyst compares what comes back. You can watch each of them work.
+        </p>
+        <div class="starters" id="starters">
+          <button type="button" class="starter" data-q="Breathable running shirt under $60">Breathable running shirt under $60</button>
+          <button type="button" class="starter" data-q="Warm merino base layer for winter runs">Warm merino base layer for winter runs</button>
+          <button type="button" class="starter" data-q="Soft cotton t-shirt for sensitive skin">Soft cotton t-shirt for sensitive skin</button>
+          <button type="button" class="starter" data-q="Which of these should I buy?">Which of these should I buy?</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="jump" id="jump" hidden>
+      <button type="button" id="jump-btn">New content below</button>
+    </div>
+
+    <form class="composer" id="composer-form">
+      <label class="visually-hidden" for="composer">Message</label>
+      <textarea id="composer" rows="1" placeholder="Ask for a product, or ask which one to buy" autocomplete="off"></textarea>
+      <button type="submit" id="send" class="send">Send</button>
+      <button type="button" id="stop" class="stop" hidden>Stop</button>
+    </form>
+  </section>
+
+  <!-- Results rail -->
+  <aside class="rail" aria-label="Results">
+    <div class="rail-empty" id="rail-empty">
+      <p>Results appear here, kept separate by where they came from.</p>
+    </div>
+
+    <div class="notice" id="notice" hidden role="status"></div>
+
+    <section class="cart" id="cart-band" hidden aria-labelledby="cart-title">
+      <div class="band-head">
+        <h2 id="cart-title">Cart</h2>
+        <span class="band-note" id="cart-note"></span>
+      </div>
+      <div class="cart-body" id="cart-body"></div>
+    </section>
+
+    <form class="refine" id="refine" hidden>
+      <label class="refine-field">
+        <span>Max price</span>
+        <input type="number" id="refine-price" min="0" step="1" inputmode="decimal" placeholder="any">
+      </label>
+      <label class="refine-field">
+        <span>Sort</span>
+        <select id="refine-sort">
+          <option value="relevance">As found</option>
+          <option value="price-asc">Price: low to high</option>
+          <option value="price-desc">Price: high to low</option>
+          <option value="rating">Best rated</option>
+        </select>
+      </label>
+      <button type="submit" id="refine-run">Refine</button>
+      <p class="refine-note" id="refine-note">Runs the scouts directly — no model turn.</p>
+    </form>
+
+    <section class="band band-catalog" id="band-catalog" hidden aria-labelledby="band-catalog-title">
+      <div class="band-head">
+        <h2 id="band-catalog-title">Catalog matches</h2>
+        <span class="band-note" id="catalog-count"></span>
+      </div>
+      <div class="grid" id="catalog-grid" role="list"></div>
+    </section>
+
+    <section class="band band-web" id="band-web" hidden aria-labelledby="band-web-title">
+      <div class="band-head">
+        <h2 id="band-web-title">Also on the web</h2>
+        <button type="button" class="band-toggle" id="web-toggle" aria-expanded="true">Hide</button>
+      </div>
+      <p class="band-caveat">Open-web listings. They can be opened, but not added to a cart.</p>
+      <div class="rows" id="web-rows" role="list"></div>
+    </section>
+  </aside>
+</main>
+
+<!-- Comparison drawer -->
+<div class="drawer-scrim" id="drawer-scrim" hidden></div>
+<aside class="drawer" id="drawer" hidden aria-labelledby="drawer-title" role="dialog" aria-modal="true">
+  <div class="drawer-head">
+    <h2 id="drawer-title">Why this one</h2>
+    <button type="button" class="drawer-close" id="drawer-close" aria-label="Close comparison">Close</button>
+  </div>
+  <div class="drawer-body" id="drawer-body"></div>
+</aside>
+
+<!-- Lightbox -->
+<div class="lightbox" id="lightbox" hidden role="dialog" aria-modal="true" aria-label="Product image">
+  <button type="button" class="lightbox-close" id="lightbox-close" aria-label="Close image">Close</button>
+  <img id="lightbox-img" alt="">
+</div>
+
+<template id="tpl-card">
+  <article class="card" role="listitem">
+    <div class="ribbon" hidden>Best pick</div>
+    <div class="film" tabindex="0" role="group" aria-roledescription="image carousel"></div>
+    <div class="dots" hidden></div>
+    <div class="card-body">
+      <h3 class="card-title"></h3>
+      <div class="card-line">
+        <span class="price"></span>
+        <span class="signal"></span>
+      </div>
+    </div>
+    <details class="more">
+      <summary>Details</summary>
+      <dl class="specs"></dl>
+    </details>
+    <div class="actions" hidden></div>
+  </article>
+</template>
+
+<script src="/app.js"></script>
+</body>
+</html>

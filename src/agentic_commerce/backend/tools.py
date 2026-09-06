@@ -69,17 +69,26 @@ def make_commerce_tools(session_id: str = DEFAULT_SESSION_ID) -> list[BaseTool]:
             query: The product search query (e.g., 'running shoes', 'cotton hoodie').
             max_price: Optional maximum price in dollars (e.g. 150.0).
         """
-        price_max_cents = int(max_price * 100) if max_price else None
+        session = _session()
 
-        async def _search():
-            products = await _ucp_client.search_catalog(
-                query=query,
-                price_max=price_max_cents,
-                limit=5,
-            )
-            _session().update_search_results(products)
+        def _search():
+            # Routed through the crew so the catalog and web scouts run concurrently,
+            # rather than the model having to decide to search the web as a second turn.
+            report = _crew.run_discovery(query, max_price=max_price, limit=5)
+            products = report.catalog_products
+            session.update_search_results(products)
+            session.update_crew_events([e.as_dict() for e in report.events])
+
+            web = [r.as_dict() for r in report.web_results]
+            if web:
+                session.update_web_results(web)
 
             if not products:
+                if web:
+                    return (
+                        f"Nothing in the Shopify catalog matched '{query}'. "
+                        + format_results(query, report.web_results)
+                    )
                 return f"No products found matching '{query}'."
 
             lines = [f"Found {len(products)} products for '{query}':\n"]
@@ -99,6 +108,10 @@ def make_commerce_tools(session_id: str = DEFAULT_SESSION_ID) -> list[BaseTool]:
                     f"{idx}. **{title}** | Price: {price_str} | ID: `{pid}` | {opt_str}{img_str}"
                 )
 
+            if web:
+                lines.append("")
+                lines.append(format_results(query, report.web_results))
+
             return "\n".join(lines)
 
         try:
@@ -107,7 +120,7 @@ def make_commerce_tools(session_id: str = DEFAULT_SESSION_ID) -> list[BaseTool]:
                 {"query": query, "max_price": max_price},
                 session_id=session_id,
             ):
-                return _run_async(_search())
+                return _search()
         except Exception as e:
             return f"Catalog search error: {e}"
 
@@ -167,7 +180,7 @@ def make_commerce_tools(session_id: str = DEFAULT_SESSION_ID) -> list[BaseTool]:
             price = featured.get("price", {}).get("amount", 0)
             domain = seller.get("domain") or seller.get("name") or "shopify.com"
 
-            _session().active_product = prod
+            _session().update_active_product(prod)
 
             lines = [
                 f"### Product: {title}",
@@ -260,7 +273,7 @@ def make_commerce_tools(session_id: str = DEFAULT_SESSION_ID) -> list[BaseTool]:
                 buyer_email=buyer_email,
             )
             continue_url = res.get("continue_url", "")
-            session.active_checkout = res
+            session.update_checkout(res)
 
             return (
                 f"✅ **Checkout Session Ready!**\n"
@@ -396,9 +409,42 @@ def make_commerce_tools(session_id: str = DEFAULT_SESSION_ID) -> list[BaseTool]:
         except Exception as e:
             return f"Payment error: {e}"
 
+    @tool
+    def pick_best_product(need: str = "") -> str:
+        """Compare the products from the last search and name the single best fit.
+
+        Delegates to the Analyst specialist, which scores every candidate on
+        rating, review volume, fabric suitability, price against the cohort, and
+        availability, then explains the verdict against the runners-up.
+
+        Args:
+            need: What the shopper actually wants in their own words — e.g.
+                'breathable shirt for hot-weather running', 'warm winter layer',
+                'soft cotton for sensitive skin'. Fabric matching is skipped when
+                no material-relevant trait is stated, so pass the shopper's own
+                phrasing rather than a bare product name.
+        """
+        session = _session()
+        products = session.last_searched_products
+        if not products:
+            return "No search results to compare yet — run `search_products` first."
+
+        try:
+            with trace_tool_execution(
+                "pick_best_product",
+                {"need": need, "candidates": len(products)},
+                session_id=session_id,
+            ):
+                verdict = _crew.run_analysis(products, need)
+                session.update_best_pick(verdict.as_dict())
+                return verdict.format_display()
+        except Exception as e:
+            return f"Analysis error: {e}"
+
     return [
         search_products,
         search_web_products,
+        pick_best_product,
         get_product_details,
         negotiate_price,
         process_test_payment,

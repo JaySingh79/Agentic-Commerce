@@ -94,7 +94,10 @@ _NEED_ASPECTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         ("cotton", "organic cotton", "linen", "bamboo", "merino", "merino wool", "modal"),
     ),
     "moisture_wicking": (
-        ("sweat", "moisture", "wicking", "running", "run", "gym", "workout", "athletic", "training"),
+        (
+            "sweat", "moisture", "wicking", "running", "run",
+            "gym", "workout", "athletic", "training",
+        ),
         ("polyester", "recycled polyester", "nylon", "elastane", "spandex", "lycra", "merino"),
     ),
     "warmth": (
@@ -381,7 +384,11 @@ def _score_one(
             if fibres & set(_NEED_ASPECTS[aspect][1])
         ]
         fit = len(met) / len(aspects)
-        detail = ", ".join(a.replace("_", " ") for a in met) if met else "none of the asked-for traits"
+        detail = (
+            ", ".join(a.replace("_", " ") for a in met)
+            if met
+            else "none of the asked-for traits"
+        )
         scored.append(
             Criterion("fabric_fit", fit, WEIGHTS["fabric_fit"], f"{fabric} — matches {detail}")
         )

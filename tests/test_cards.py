@@ -123,3 +123,132 @@ def test_css_is_wired_into_the_launched_app():
     app_py = Path(__file__).resolve().parents[1] / "src/agentic_commerce/ui/app.py"
     source = app_py.read_text(encoding="utf-8")
     assert "css=CUSTOM_CSS" in source
+
+
+RICH_PRODUCT = {
+    "id": "gid://shopify/p/9",
+    "title": "Merino Base Layer",
+    "price_range": {"min": {"amount": 6500, "currency": "USD"}},
+    "rating": {"value": 4.8, "scale_max": 5, "count": 42},
+    "metadata": {"tech_specs": "Fabric: Merino Wool\nSleeve Length: Long"},
+    "options": [{"name": "Size", "values": ["S", "M", "L"]}],
+    "media": [{"type": "image", "url": "https://cdn.example/base.jpg"}],
+    "variants": [
+        {
+            "id": "v1",
+            "url": "https://shop.example/p/9",
+            "availability": {"available": True},
+            "seller": "Trailworks",
+        }
+    ],
+}
+
+
+def test_card_has_a_click_to_expand_details_layer():
+    out = render_product_grid([RICH_PRODUCT])
+    assert "<details class=\"ac-card-more\">" in out
+    assert "<summary>Details</summary>" in out
+    # The facts a shopper actually needs before clicking through.
+    assert "Merino Wool" in out
+    assert "4.8/5 (42 reviews)" in out
+    assert "Trailworks" in out
+    assert "In stock" in out
+    assert "Size (3)" in out
+
+
+def test_details_disclosure_is_a_sibling_of_the_link_not_a_child():
+    """An interactive <details> inside an <a> is invalid and would navigate away."""
+    out = render_product_grid([RICH_PRODUCT])
+    anchor_start = out.index("<a class=\"ac-card-link\"")
+    anchor_end = out.index("</a>", anchor_start)
+    details_start = out.index("<details")
+    assert details_start > anchor_end
+
+
+def test_card_with_nothing_to_show_omits_the_disclosure_entirely():
+    """An expander that opens onto blank space is worse than no expander."""
+    bare = {"id": "x", "title": "Bare", "variants": []}
+    out = render_product_grid([bare])
+    assert "ac-card" in out
+    assert "<details" not in out
+
+
+def test_detail_values_are_escaped():
+    """Detail rows carry catalog copy, so they are an injection sink too."""
+    hostile = {
+        "id": "x",
+        "title": "Hostile",
+        "metadata": {"tech_specs": "Fabric: <script>alert(1)</script>"},
+        "variants": [{"id": "v", "seller": '"><img src=x onerror=alert(1)>'}],
+    }
+    out = render_product_grid([hostile])
+    # Scoped to the disclosure: the card legitimately contains its own <img>.
+    # The property that matters is that the hostile copy forms no live tag and
+    # survives only as inert escaped text.
+    disclosure = out[out.index("<details") :]
+    assert "<script" not in disclosure
+    assert "<img" not in disclosure
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in disclosure
+    assert "&lt;img src=x onerror=alert(1)&gt;" in disclosure
+
+
+def test_best_pick_ribbons_only_the_winning_card():
+    other = {**RICH_PRODUCT, "id": "gid://shopify/p/10", "title": "Runner Up"}
+    verdict = {
+        "winner": {
+            "product_id": "gid://shopify/p/9",
+            "criteria": [
+                {"name": "fabric_fit", "score": 1.0, "weight": 0.4, "evidence": "Merino — warmth"},
+                {"name": "rating", "score": 0.95, "weight": 0.3, "evidence": "4.8/5 rated"},
+            ],
+            "missing": ["price_value"],
+        }
+    }
+
+    out = render_product_grid([RICH_PRODUCT, other], verdict)
+
+    assert out.count("ac-card-ribbon") == 1
+    assert out.count("ac-card-best") == 1
+    # The reasoning rides on the product, not just in the transcript.
+    assert "Merino — warmth" in out
+    assert "Not scored" in out and "price_value" in out
+    # The ribbon must sit on the winner's card, not the runner-up's.
+    assert out.index("Best pick") < out.index("Runner Up")
+
+
+def test_results_panel_passes_the_verdict_through():
+    verdict = {"winner": {"product_id": PRODUCT["id"], "criteria": [], "missing": []}}
+    out = render_results_panel([PRODUCT], [], verdict)
+    assert "ac-card-best" in out
+
+
+def test_web_cards_expand_to_show_the_snippet():
+    out = render_web_grid([{**WEB, "snippet": "Breathable knit upper, 4.5 stars"}])
+    assert "<details" in out
+    assert "Breathable knit upper" in out
+
+
+def test_a_favicon_only_web_card_gets_a_different_silhouette():
+    """A 128px favicon stretched into a square photo slot made the grid ragged."""
+    html_out = render_web_grid([
+        {"title": "Category", "url": "https://a.example/c", "source": "a.example",
+         "image_url": None, "favicon_url": "https://icons.example/a.png"},
+    ])
+    assert "ac-card-compact" in html_out
+
+
+def test_a_web_card_with_a_real_photo_keeps_the_full_slot():
+    html_out = render_web_grid([
+        {"title": "Shoe", "url": "https://a.example/p", "source": "a.example",
+         "image_url": "https://a.example/p.jpg"},
+    ])
+    assert "ac-card-compact" not in html_out
+
+
+def test_web_cards_carry_no_cart_control():
+    """Non-purchasable is structural: the affordance is absent, not disabled."""
+    html_out = render_web_grid([
+        {"title": "Shoe", "url": "https://a.example/p", "source": "a.example",
+         "image_url": "https://a.example/p.jpg"},
+    ])
+    assert "add-to-cart" not in html_out and "<button" not in html_out
