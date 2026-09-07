@@ -68,3 +68,13 @@ coverage/
 
 # Durable session snapshots (backend/session_store.py)
 .agentic_commerce/
+
+AGENTS.md
+GEMINI.md
+PLAN_OF_ACTION.md
+memory.md
+project_context.md
+logs.txt
+skills-lock.json
+logs
+opencode.json
