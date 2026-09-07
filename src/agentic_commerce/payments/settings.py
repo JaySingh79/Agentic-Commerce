@@ -11,6 +11,7 @@ never a stray environment variable.
 
 from __future__ import annotations
 
+import base64
 import os
 import re
 from dataclasses import dataclass
@@ -21,8 +22,12 @@ from agentic_commerce.payments.models import PaymentConfigurationError
 #: Network timeout (seconds) for provider API calls.
 TIMEOUT = 20.0
 
-#: Hard cap on a whole MCP bridge exchange (spawn + handshake + tool call).
+#: Hard cap on a whole MCP bridge exchange (handshake + tool call).
 BRIDGE_TIMEOUT = 60.0
+
+#: Razorpay's hosted remote MCP server (streamable HTTP). Overridable for
+#: pointing at a self-hosted or staging endpoint.
+DEFAULT_MCP_URL = "https://mcp.razorpay.com/mcp"
 
 _RAZORPAY_TEST_PREFIX = "rzp_test_"
 _STRIPE_TEST_PREFIX = "sk_test_"
@@ -76,8 +81,7 @@ class PaymentSettings:
     stripe_secret_key: str
     razorpay_webhook_secret: str
     mcp_bridge: bool
-    mcp_container: str
-    mcp_toolsets: str
+    mcp_url: str
     strict: bool
     timeout: float = TIMEOUT
     bridge_timeout: float = BRIDGE_TIMEOUT
@@ -94,8 +98,7 @@ class PaymentSettings:
             ),
             razorpay_webhook_secret=os.getenv("RAZORPAY_WEBHOOK_SECRET", ""),
             mcp_bridge=os.getenv("RAZORPAY_MCP_BRIDGE", "") == "1",
-            mcp_container=os.getenv("RAZORPAY_MCP_CONTAINER", "") or "razorpay-mcp",
-            mcp_toolsets=os.getenv("RAZORPAY_MCP_TOOLSETS", "") or "orders,payments",
+            mcp_url=os.getenv("RAZORPAY_MCP_URL", "") or DEFAULT_MCP_URL,
             strict=os.getenv("AC_PAYMENTS_STRICT", "") == "1",
         )
 
@@ -139,9 +142,25 @@ class PaymentSettings:
             )
         return bool(credentials_are_live)
 
+    @property
+    def mcp_auth_header(self) -> str:
+        """HTTP Basic auth value for Razorpay's remote MCP server.
+
+        Built from the same key id/secret ``require_razorpay`` already
+        validates — the remote server authenticates exactly like the REST
+        API, just over an ``Authorization: Basic`` header instead of query
+        auth.
+        """
+        token = base64.b64encode(
+            f"{self.razorpay_key_id}:{self.razorpay_key_secret}".encode()
+        ).decode()
+        return f"Basic {token}"
+
     def redact(self, text: str) -> str:
         """Redacts this configuration's secrets out of arbitrary provider text."""
-        return redact(text, self.razorpay_key_secret, self.stripe_secret_key)
+        return redact(
+            text, self.razorpay_key_secret, self.stripe_secret_key, self.mcp_auth_header
+        )
 
 
 def _select_provider() -> str:

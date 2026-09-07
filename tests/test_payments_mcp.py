@@ -1,9 +1,10 @@
-"""Tests for the Razorpay MCP provider — hermetic, no container required.
+"""Tests for the Razorpay MCP provider — hermetic, no live server required.
 
-The MCP session is faked at the ``mcp`` SDK boundary (``stdio_client`` /
+The MCP session is faked at the ``mcp`` SDK boundary (``streamablehttp_client`` /
 ``ClientSession``), so these exercise the real handshake ordering, capability check,
-argument resolution and error mapping without Docker. Live-container checks stay manual
-and read-only: ``fetch_order`` before anything that writes.
+argument resolution and error mapping without contacting Razorpay's remote MCP
+server. Live-server checks stay manual and read-only: ``fetch_order`` before
+anything that writes.
 
 The load-bearing test here is
 ``test_gateway_does_not_silently_fall_back_to_rest_when_the_bridge_fails``: the previous
@@ -11,20 +12,18 @@ bridge swallowed its own failures, so a broken bridge silently created a *second
 through REST for the same receipt.
 """
 
+import base64
 import json
 import types
 
+import httpx
 import pytest
 
 from agentic_commerce.core.runtime import run_async
 from agentic_commerce.payments import gateway as payment_gateway
 from agentic_commerce.payments.models import PaymentConfigurationError
 from agentic_commerce.payments.providers import mcp as mcp_provider
-from agentic_commerce.payments.providers.mcp import (
-    RazorpayMcpProvider,
-    _bridge_argv,
-    _bridge_enabled,
-)
+from agentic_commerce.payments.providers.mcp import RazorpayMcpProvider, _bridge_enabled
 from agentic_commerce.payments.providers.razorpay import RazorpayProvider
 
 ORDER_JSON = {
@@ -86,9 +85,9 @@ class _FakeSession:
 
 @pytest.fixture
 def fake_bridge(monkeypatch: pytest.MonkeyPatch):
-    """Installs a fake MCP stdio session and returns the recorded call log."""
+    """Installs a fake remote MCP session and returns the recorded call log."""
 
-    def _install(tools=None, response=None):
+    def _install(tools=None, response=None, connect_error=None):
         calls: list[tuple] = []
         tools = tools if tools is not None else [
             _FakeTool("create_order", ["amount", "currency", "receipt"]),
@@ -96,12 +95,14 @@ def fake_bridge(monkeypatch: pytest.MonkeyPatch):
         ]
         response = response if response is not None else _FakeResponse(json.dumps(ORDER_JSON))
 
-        class _Stdio:
-            def __init__(self, server):
-                calls.append(("spawn", server.command, tuple(server.args)))
+        class _StreamableHttp:
+            def __init__(self, url, headers=None, timeout=None, sse_read_timeout=None):
+                calls.append(("connect", url, headers, timeout, sse_read_timeout))
 
             async def __aenter__(self):
-                return ("read", "write")
+                if connect_error is not None:
+                    raise connect_error
+                return ("read", "write", lambda: None)
 
             async def __aexit__(self, *_exc):
                 return False
@@ -111,9 +112,9 @@ def fake_bridge(monkeypatch: pytest.MonkeyPatch):
             return _FakeSession(calls, tools, response)
 
         import mcp
-        import mcp.client.stdio
+        import mcp.client.streamable_http
 
-        monkeypatch.setattr(mcp.client.stdio, "stdio_client", _Stdio)
+        monkeypatch.setattr(mcp.client.streamable_http, "streamablehttp_client", _StreamableHttp)
         monkeypatch.setattr(mcp, "ClientSession", _session)
         return calls
 
@@ -132,12 +133,25 @@ def test_bridge_is_opt_in(monkeypatch: pytest.MonkeyPatch):
     assert _bridge_enabled() is True
 
 
-def test_bridge_argv_expands_keys_inside_the_container():
-    """The secret must never appear in this process's argv."""
-    argv = _bridge_argv()
-    assert argv[:4] == ["docker", "exec", "-i", "razorpay-mcp"]
-    assert '"$RAZORPAY_KEY_ID"' in argv[-1]
-    assert "supersecret" not in " ".join(argv)
+def test_connects_to_the_default_remote_endpoint_with_basic_auth(fake_bridge):
+    """The secret must reach the server only as a Basic auth header, never in argv/logs."""
+    calls = fake_bridge()
+    run_async(RazorpayMcpProvider().create_order(4500, "INR", "cart_1"))
+
+    connect = next(call for call in calls if call[0] == "connect")
+    _, url, headers, *_ = connect
+    assert url == "https://mcp.razorpay.com/mcp"
+    expected_token = base64.b64encode(b"rzp_test_abc:supersecret").decode()
+    assert headers == {"Authorization": f"Basic {expected_token}"}
+
+
+def test_remote_url_is_overridable(monkeypatch: pytest.MonkeyPatch, fake_bridge):
+    monkeypatch.setenv("RAZORPAY_MCP_URL", "https://staging.example/mcp")
+    calls = fake_bridge()
+    run_async(RazorpayMcpProvider().create_order(4500, "INR", "cart_1"))
+
+    connect = next(call for call in calls if call[0] == "connect")
+    assert connect[1] == "https://staging.example/mcp"
 
 
 def test_handshake_completes_before_the_tool_is_called(fake_bridge):
@@ -161,14 +175,14 @@ def test_create_order_maps_onto_payment_result(fake_bridge):
 
 
 def test_missing_server_tools_are_refused_before_calling(fake_bridge):
-    """Capability negotiation: an image without the orders toolset must not be used."""
+    """Capability negotiation: a server without the orders toolset must not be used."""
     fake_bridge(tools=[_FakeTool("fetch_payment", ["payment_id"])])
     with pytest.raises(PaymentConfigurationError, match="required tools"):
         run_async(RazorpayMcpProvider().create_order(4500, "INR", "cart_1"))
 
 
 def test_id_argument_is_resolved_from_the_server_schema(fake_bridge):
-    """Different image versions name the id parameter differently."""
+    """Different server versions name the id parameter differently."""
     calls = fake_bridge(
         tools=[
             _FakeTool("create_order", ["amount"]),
@@ -192,7 +206,14 @@ def test_unparseable_content_is_reported(fake_bridge):
         run_async(RazorpayMcpProvider().create_order(4500, "INR", "cart_1"))
 
 
-def test_live_key_is_refused_before_the_container_is_contacted(
+def test_remote_server_unreachable_is_reported_not_swallowed(fake_bridge):
+    """A network failure connecting to the remote server must surface clearly."""
+    fake_bridge(connect_error=httpx.ConnectError("connection refused"))
+    with pytest.raises(PaymentConfigurationError, match="unreachable or unauthorized"):
+        run_async(RazorpayMcpProvider().create_order(4500, "INR", "cart_1"))
+
+
+def test_live_key_is_refused_before_the_remote_server_is_contacted(
     monkeypatch: pytest.MonkeyPatch, fake_bridge
 ):
     calls = fake_bridge()
@@ -224,7 +245,7 @@ def test_gateway_does_not_silently_fall_back_to_rest_when_the_bridge_fails(
     monkeypatch.setenv("RAZORPAY_MCP_BRIDGE", "1")
 
     async def _broken(self, tool, arguments):
-        raise PaymentConfigurationError("MCP bridge session failed: container is gone")
+        raise PaymentConfigurationError("MCP bridge session failed: server unreachable")
 
     async def _rest_must_not_run(self, amount_cents, currency, receipt):
         raise AssertionError("REST silently created a second order")
@@ -232,7 +253,7 @@ def test_gateway_does_not_silently_fall_back_to_rest_when_the_bridge_fails(
     monkeypatch.setattr(mcp_provider.RazorpayMcpProvider, "call_tool", _broken)
     monkeypatch.setattr(RazorpayProvider, "create_order", _rest_must_not_run)
 
-    with pytest.raises(PaymentConfigurationError, match="container is gone"):
+    with pytest.raises(PaymentConfigurationError, match="server unreachable"):
         run_async(payment_gateway.process_payment(4500, "INR", "cart_broken"))
 
 

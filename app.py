@@ -1,3 +1,5 @@
+"""LEGACY (not served): Gradio UI. Active path is api.server (:8010)."""
+
 import os
 import sys
 from pathlib import Path

@@ -1,5 +1,7 @@
 # Entire project in one stack: FastAPI (8010, serves API + web/)
-# + Razorpay MCP server (stdio, reached via `docker exec` bridge)
+# + Razorpay payments over its hosted remote MCP server (streamable HTTP,
+#   https://mcp.razorpay.com/mcp) when RAZORPAY_MCP_BRIDGE=1 — no local
+#   container, no docker.sock, both containers run non-root.
 # + telemetry (OTLP collector / Tempo / Prometheus / Grafana :3000), folded in
 #   via `include:` below so one command brings up the whole stack.
 # LEGACY (retained, not served): Gradio UI (7860, `ui` service below).
@@ -7,8 +9,7 @@
 # Usage:
 #   docker compose up -d --build          # everything, telemetry included
 #   docker compose logs -f api ui         # follow app logs
-#   docker compose up -d --build api ui razorpay-mcp
-#                                          # opt out of telemetry (lighter local run)
+#   docker compose up -d --build api ui   # opt out of telemetry (lighter local run)
 #
 # Secrets are never baked into the image: they flow from `.env` via `env_file`.
 # Session snapshots live on the shared `session-data` volume so both frontends
@@ -20,10 +21,6 @@ services:
   api:
     build: .
     container_name: agentic-commerce-api
-    # Root is required here (and only here): the host docker.sock is 660
-    # root:root, and the MCP bridge shells out to `docker exec`. The image
-    # itself stays non-root by default; this override is a local-dev tradeoff.
-    user: "0:0"
     command: ["python", "-m", "agentic_commerce.api.server"]
     ports:
       - "8010:8010"
@@ -38,17 +35,8 @@ services:
       # mandates are worthless if the record dies with the container.
       - AC_PAYMENTS_DB=/data/payments.db
       - RAZORPAY_MCP_BRIDGE=1
-      - RAZORPAY_MCP_CONTAINER=agentic-commerce-razorpay-mcp
-      - RAZORPAY_MCP_TOOLSETS=orders,payments
     volumes:
       - session-data:/data
-      # The MCP bridge shells out to `docker exec`; the CLI is in the image,
-      # the daemon is reached through this socket (local-dev convenience).
-      - /var/run/docker.sock:/var/run/docker.sock
-    depends_on:
-      - razorpay-mcp
-    cap_add:
-      - SYS_PTRACE  # TEMP: live py-spy diagnosis of checkout hang, revert after RCA
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8010/openapi.json')"]
       interval: 30s
@@ -60,9 +48,6 @@ services:
   ui:
     build: .
     container_name: agentic-commerce-ui
-    # Same root override as `api`: the ChatEngine path also reaches payments,
-    # so the UI needs the MCP bridge (and hence the daemon socket) too.
-    user: "0:0"
     command: ["python", "app.py"]
     ports:
       - "7860:7860"
@@ -76,30 +61,14 @@ services:
       # mandates are worthless if the record dies with the container.
       - AC_PAYMENTS_DB=/data/payments.db
       - RAZORPAY_MCP_BRIDGE=1
-      - RAZORPAY_MCP_CONTAINER=agentic-commerce-razorpay-mcp
-      - RAZORPAY_MCP_TOOLSETS=orders,payments
     volumes:
       - session-data:/data
-      - /var/run/docker.sock:/var/run/docker.sock
-    depends_on:
-      - razorpay-mcp
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:7860/')"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 90s
-
-  razorpay-mcp:
-    image: razorpay/mcp:latest # pin to a dated tag (e.g. :v1.0.0) for reproducible builds
-    container_name: agentic-commerce-razorpay-mcp
-    stdin_open: true # detached stdio server; clients attach via `docker exec -i`
-    env_file:
-      - .env # supplies RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET to the server
-    command: >
-      sh -c 'exec ./razorpay-mcp-server stdio
-      --key "$$RAZORPAY_KEY_ID" --secret "$$RAZORPAY_KEY_SECRET"
-      --toolsets orders,payments'
 
 volumes:
   session-data:

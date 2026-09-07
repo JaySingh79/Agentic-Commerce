@@ -78,16 +78,15 @@ docker compose up -d --build
 docker compose logs -f api
 ```
 
-This starts `api`, a compose-managed `razorpay-mcp` container
-(`agentic-commerce-razorpay-mcp`, so it never clashes with a standalone one),
-and the telemetry stack (`docker-compose.telemetry.yml`, folded in via
-`include:`) — one command, everything up
-(LEGACY `ui`/Gradio service retained in compose but not served).
+This starts `api` (Razorpay payments reach Razorpay's hosted remote MCP server
+directly, no extra container) and the telemetry stack
+(`docker-compose.telemetry.yml`, folded in via `include:`) — one command,
+everything up (LEGACY `ui`/Gradio service retained in compose but not served).
 
 To skip telemetry for a lighter local run, name the services explicitly:
 
 ```bash
-docker compose up -d --build api ui razorpay-mcp
+docker compose up -d --build api ui
 ```
 
 ### Option B — local processes
@@ -142,10 +141,10 @@ never collapsed into "invalid".
 **5. Capture test money.** `POST /api/payments/test`
 `{"amount_cents": 100, "currency": "INR"}` routes Razorpay → Stripe → simulated
 (`payments/gateway.py`). With `RAZORPAY_MCP_BRIDGE=1` the order is created
-*through the local `razorpay-mcp` container* over MCP/JSON-RPC
-(`payments/mcp.py`); otherwise direct REST. Every receipt carries `live`, and
-the UI badge renders from that field — try a simulated capture and confirm it
-says TEST / SIMULATED.
+*through Razorpay's hosted remote MCP server* (`https://mcp.razorpay.com/mcp`,
+streamable HTTP, HTTP Basic auth) instead of direct REST (`payments/mcp.py`).
+Every receipt carries `live`, and the UI badge renders from that field — try a
+simulated capture and confirm it says TEST / SIMULATED.
 
 **6. Inspect your session as a graph.** `GET /api/session/{id}/graph` renders
 the session as nodes/edges (~19× fewer tokens than the raw snapshot;
@@ -193,8 +192,8 @@ All via environment (`.env` locally, `env_file` in compose):
 | `CATALOG_ID` | Custom catalog whitelist; empty = Global Catalog | `''` |
 | `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` | Razorpay (test keys `rzp_test_*` only) | — (simulated gateway) |
 | `STRIPE_SECRET_KEY` / `STRIPE_API_KEY` | Stripe fallback (`sk_test_*` only) | — |
-| `RAZORPAY_MCP_BRIDGE=1` | Route Razorpay orders through the local MCP container | off (direct REST) |
-| `RAZORPAY_MCP_CONTAINER` / `RAZORPAY_MCP_TOOLSETS` | Bridge target and server-side tool scope | `razorpay-mcp` / `orders,payments` |
+| `RAZORPAY_MCP_BRIDGE=1` | Route Razorpay orders through Razorpay's remote MCP server | off (direct REST) |
+| `RAZORPAY_MCP_URL` | Remote MCP endpoint override | `https://mcp.razorpay.com/mcp` |
 | `TAVILY_API_KEY` | Web search provider (else DuckDuckGo) | — |
 | `RAZORPAY_WEBHOOK_SECRET` | Verifies `X-Razorpay-Signature` on `/api/payments/webhook/razorpay`; unset = the route refuses with `503` | — |
 | `AC_PAYMENTS_PERSIST` / `AC_PAYMENTS_DB` | Payment ledger (idempotency, mandate single-use, webhook dedupe) on/off + path | on / `.agentic_commerce/payments.db` (compose: `/data/payments.db`) |
@@ -243,18 +242,23 @@ and `mcp.py` at the package root are compatibility shims. Rules:
 
 ### Extend the MCP bridge
 
-`payments/providers/mcp.py` is a real MCP client (`mcp.ClientSession` over a
-`docker exec -i` stdio transport, because the `razorpay/mcp` image is stdio-only): it
-completes the `initialize` handshake before calling anything, asserts the tools it needs
-appear in `tools/list`, resolves each tool's id argument from that tool's own
-`inputSchema`, and enforces a per-request timeout. **It is a development path** — a host
-Docker socket is not a production transport — and when `RAZORPAY_MCP_BRIDGE=1` a bridge
+`payments/providers/mcp.py` is a real MCP client (`mcp.ClientSession` over
+`streamablehttp_client`, talking to Razorpay's hosted remote MCP server at
+`https://mcp.razorpay.com/mcp`, HTTP Basic auth over the same key id/secret the
+REST API uses): it completes the `initialize` handshake before calling
+anything, asserts the tools it needs appear in `tools/list`, resolves each
+tool's id argument from that tool's own `inputSchema`, and enforces a
+per-request timeout. This is Razorpay's own recommended deployment path — no
+local container, no Docker socket — and when `RAZORPAY_MCP_BRIDGE=1` a bridge
 failure is raised rather than degraded to REST, because both paths create orders.
 
-To expose more tools (refunds, payment links, settlements), add a method that calls
-`call_tool` and maps the JSON onto `PaymentResult`, and cover it with a hermetic test
-(fake `stdio_client`/`ClientSession`, see `tests/test_payments_mcp.py`). Live-container
-checks stay manual and read-only where possible (`fetch_*` before any write).
+To expose more tools (payment links, settlements — `create_refund`,
+`close_qr_code`, and `create_instant_settlement` are local-server-only per
+Razorpay's tools reference and unavailable remotely), add a method that calls
+`call_tool` and maps the JSON onto `PaymentResult`, and cover it with a hermetic
+test (fake `streamablehttp_client`/`ClientSession`, see
+`tests/test_payments_mcp.py`). Live-server checks stay manual and read-only
+where possible (`fetch_*` before any write).
 
 ### Build a third frontend
 
@@ -296,21 +300,17 @@ may change only as an explicitly declared contract change. Browser JS
 ## 8. Docker reference
 
 ```bash
-docker compose up -d --build        # api :8010 · razorpay-mcp (stdio) · telemetry :3000/:9090; ui :7860 is LEGACY
-docker compose up -d --build api ui razorpay-mcp   # opt out of telemetry
-docker compose ps                   # api + razorpay-mcp + telemetry stack healthy
+docker compose up -d --build        # api :8010 · telemetry :3000/:9090; ui :7860 is LEGACY
+docker compose up -d --build api ui   # opt out of telemetry
+docker compose ps                   # api + telemetry stack healthy
 docker compose logs -f api
 docker compose down                 # stack down; session-data volume persists
 ```
 
-- Image: `python:3.13-slim` + `uv sync --locked --no-dev`; Docker CLI included
-  for the MCP bridge; non-root `appuser` by default.
-- Compose runs app services as `user: "0:0"` — required because the host
-  `docker.sock` is `660 root:root` and the bridge shells out to `docker exec`.
-  Local-dev tradeoff, documented in `docker-compose.yml`; the image default is
-  unchanged.
-- `razorpay-mcp` here is named `agentic-commerce-razorpay-mcp` so it never
-  collides with a standalone `razorpay-mcp` container.
+- Image: `python:3.13-slim` + `uv sync --locked --no-dev`; non-root `appuser`
+  everywhere — Razorpay payments reach MCP over Razorpay's hosted remote
+  server, so no Docker CLI/socket and no root override are needed in this
+  image or compose file.
 - UCP demo scripts (`backend/*_demo.js`, `ucp_demo.js`) run via Node and are
   intentionally *not* in the image: `node --env-file=.env
   src/agentic_commerce/backend/ucp_demo.js`.
@@ -352,7 +352,7 @@ docker compose down                 # stack down; session-data volume persists
 | `401`/`-32000 AuthenticationFailed` on merchant checkout | Store restricts programmatic checkout → Cart MCP `continue_url` referral handoff is the universal path (`project_memory.md` §4.2) |
 | Catalog searches return nothing | Custom `CATALOG_ID` whitelist is empty/restrictive → unset it for Global Catalog |
 | Payments always `simulated` | No test keys in env, or bridge off with no keys → set `rzp_test_*` keys / `RAZORPAY_MCP_BRIDGE=1` |
-| `docker exec` permission denied in container | Host socket is root-only → keep the compose `user: "0:0"` override |
+| MCP bridge reports "unreachable or unauthorized" | Bad/expired Razorpay key id or secret, or no network egress to `mcp.razorpay.com` → verify `RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET`, override `RAZORPAY_MCP_URL` only for a staging endpoint |
 | UI shows previous turn's agents on chit-chat | Regression of the `execute_stream`/`_stream_turn` identity fix — see `FEATURES.md` §5 |
 | Clicks do nothing (dark tint over page) | `[hidden]` display regression — `web/styles.css` guard + `tests/test_web_assets.py` |
 | `uv sync` fails in Docker build | Stale lockfile → `uv lock` locally, rebuild; never hand-edit `uv.lock` |

@@ -12,8 +12,8 @@ uv run ruff check src tests                    # lint (E,F,I,UP,B,SIM · line-le
 uv run pytest -q                               # full suite (~65s, 26 files)
 uv run pytest tests/test_payments.py -q        # one file
 uv run pytest tests/test_payments.py::test_name -q          # one test
-docker compose up -d --build                                # api :8010 · ui :7860 · razorpay-mcp (stdio) · telemetry :3000 (all included)
-docker compose up -d --build api ui razorpay-mcp             # opt out of telemetry
+docker compose up -d --build                                # api :8010 · ui :7860 · telemetry :3000 (all included)
+docker compose up -d --build api ui                          # opt out of telemetry
 node --env-file=.env src/agentic_commerce/backend/ucp_demo.js   # UCP demo scripts (not in image)
 ```
 

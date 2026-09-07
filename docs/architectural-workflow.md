@@ -59,7 +59,7 @@
 |  Shopify: api.shopify.com/auth/access_token,                      |
 |           catalog.shopify.com/api/ucp/mcp,                        |
 |           {shop}/.well-known/ucp, {shop}/api/ucp/mcp              |
-|  razorpay-mcp container (stdio, docker exec -i bridge)            |
+|  Razorpay remote MCP server (mcp.razorpay.com, streamable HTTP)   |
 |  Tavily (else DuckDuckGo) for web search                          |
 |  OTel Collector -> Tempo / Prometheus -> Grafana                  |
 +------------------------------------------------------------------+
@@ -79,12 +79,14 @@ Docker (recommended):
   docker compose up -d --build
     api           : python -m agentic_commerce.api.server :8010
                     (serves /api/* + /openapi.json + web/ at /)
-                    volumes: session-data:/data + /var/run/docker.sock
+                    volumes: session-data:/data
                     env: AC_SESSION_DB=/data/sessions.db,
                          AC_PAYMENTS_DB=/data/payments.db,
                          RAZORPAY_MCP_BRIDGE=1
-    razorpay-mcp  : razorpay/mcp:latest stdio, toolsets orders,payments
-                    env from .env (RAZORPAY_KEY_ID / SECRET)
+                    Razorpay payments (when RAZORPAY_MCP_BRIDGE=1) reach
+                    Razorpay's hosted remote MCP server directly
+                    (https://mcp.razorpay.com/mcp, HTTP Basic auth) — no
+                    extra container, no docker.sock.
     LEGACY (not served): ui service (python app.py :7860, Gradio) is
                     retained in docker-compose.yml for reference only.
     otel-collector, tempo, prometheus, grafana : telemetry stack, defined in
@@ -92,14 +94,14 @@ Docker (recommended):
                     `docker compose up -d --build` via docker-compose.yml's
                     top-level `include:` (Grafana :3000, Prometheus :9090,
                     OTLP :4318). Opt out with an explicit service list:
-                    `docker compose up -d --build api ui razorpay-mcp`.
+                    `docker compose up -d --build api ui`.
 ```
 
-Single image (`Dockerfile`): `python:3.13-slim` + `uv` + Docker CLI static
-binary (for `payments/mcp.py` bridge) + `src/` + `web/` + `openapi.json`
-(+ legacy `app.py` retained but not served). Default CMD is the API
-(`python -m agentic_commerce.api.server`). Non-root `appuser`, except compose
-overrides `api` to `0:0` to reach `docker.sock` (`ui` override is legacy).
+Single image (`Dockerfile`): `python:3.13-slim` + `uv` + `src/` + `web/` +
+`openapi.json` (+ legacy `app.py` retained but not served). Default CMD is the
+API (`python -m agentic_commerce.api.server`). Non-root `appuser` everywhere —
+no Docker CLI/socket in the image, no root override in compose, since
+`payments/providers/mcp.py` talks to Razorpay's remote MCP server over HTTP.
 No secrets baked in — all via `.env` / `env_file`.
 
 ## 3. End-to-End Turn Workflow (chat path — the primary path)
@@ -227,12 +229,15 @@ POST /api/payments/test {amount_cents, currency}  (mandate-free, for probes)
 
 MCP bridge (when RAZORPAY_MCP_BRIDGE=1):
   payments/providers/mcp.py: real MCP client (mcp.ClientSession over
-  `docker exec -i <container>` stdio) -> initialize handshake ->
+  streamablehttp_client -> Razorpay's hosted remote MCP server,
+  https://mcp.razorpay.com/mcp, HTTP Basic auth) -> initialize handshake ->
   tools/list assertion -> inputSchema-driven arg resolution -> call_tool
   with per-request timeout. Bridge failure RAISED, not degraded to REST
-  (both create orders). Dev-only: host docker.sock is not prod transport.
-  To add tools (refunds/links): add call_tool mapper + hermetic test with
-  fake stdio_client/ClientSession (see tests/test_payments_mcp.py).
+  (both create orders). Razorpay's recommended deployment path — no local
+  container, no docker.sock. To add tools (payment links/settlements;
+  create_refund/close_qr_code/create_instant_settlement are local-only,
+  unavailable here): add call_tool mapper + hermetic test with fake
+  streamablehttp_client/ClientSession (see tests/test_payments_mcp.py).
 
 POST /api/payments/webhook/razorpay
   -> providers/razorpay.py:verify_webhook_signature (X-Razorpay-Signature)
@@ -263,7 +268,7 @@ GET  /api/health + GET /api/models + GET /api/examples
 | `CATALOG_ID` | empty = Global Catalog |
 | `RAZORPAY_KEY_ID` (`rzp_test_*` only) / `RAZORPAY_KEY_SECRET` | test gateway; live keys refused |
 | `STRIPE_SECRET_KEY` (`sk_test_*` only) | fallback |
-| `RAZORPAY_MCP_BRIDGE`, `RAZORPAY_MCP_CONTAINER`, `RAZORPAY_MCP_TOOLSETS` | stdio bridge switch + target |
+| `RAZORPAY_MCP_BRIDGE`, `RAZORPAY_MCP_URL` | remote MCP switch + endpoint override |
 | `TAVILY_API_KEY` | else DuckDuckGo |
 | `RAZORPAY_WEBHOOK_SECRET` | unset => webhook route 503 |
 | `AC_PAYMENTS_PERSIST` / `AC_PAYMENTS_DB` | ledger on + path |

@@ -1,21 +1,19 @@
-"""Razorpay over MCP, using a real MCP client session. **Development path only.**
+"""Razorpay over MCP, using a real MCP client session against Razorpay's hosted
+remote MCP server (``https://mcp.razorpay.com/mcp``, streamable HTTP).
 
-The ``razorpay/mcp`` image speaks MCP over stdio and exposes no port, so the transport
-is ``docker exec -i`` into the running container. That is a development arrangement, not
-a production one: it needs the host Docker socket and a root-ish app container. Direct
-REST stays the production path; this exists so the MCP tool surface (orders, payments,
-and eventually refunds/links) can be exercised locally.
+This is Razorpay's own recommended deployment path (see
+https://razorpay.com/docs/mcp-server/remote): a hosted, zero-infrastructure
+endpoint authenticated with HTTP Basic auth over the same key id/secret the
+REST API already uses. It replaces an earlier local arrangement that shelled
+out to ``docker exec`` against a self-hosted ``razorpay/mcp`` container — that
+needed the host Docker socket and a root-ish app container, neither of which
+this transport requires.
 
-What changed from the previous bridge: it now *is* an MCP client. ``mcp.ClientSession``
-performs a real ``initialize`` handshake, waits for the response before sending anything
-else, negotiates capabilities, and enforces a per-request timeout. The old code wrote
-``initialize``, ``notifications/initialized`` and ``tools/call`` into one stdin blob
-before reading a single byte, dropped any stdout line that failed to parse, and had its
-every failure swallowed by the caller — so a broken bridge looked exactly like a working
-one that had chosen REST, and could create a second order for the same receipt.
-
-Keys are still expanded *inside* the container (``"$RAZORPAY_KEY_ID"``), so the secret
-never enters this process's argv.
+``mcp.ClientSession`` performs a real ``initialize`` handshake, waits for the
+response before sending anything else, negotiates capabilities, and enforces a
+per-request timeout — so a broken connection surfaces as an error, never as a
+silently-swallowed failure that could create a second order for the same
+receipt.
 """
 
 from __future__ import annotations
@@ -25,6 +23,8 @@ import os
 from datetime import timedelta
 from typing import Any
 
+import httpx
+
 from agentic_commerce.payments.models import (
     PaymentConfigurationError,
     PaymentResult,
@@ -33,12 +33,8 @@ from agentic_commerce.payments.models import (
 )
 from agentic_commerce.payments.settings import PaymentSettings
 
-#: Opt-in flag: only bridge to the container when explicitly enabled.
+#: Opt-in flag: only route through MCP (instead of direct REST) when enabled.
 BRIDGE_ENV = "RAZORPAY_MCP_BRIDGE"
-#: Container name override (default ``razorpay-mcp``).
-CONTAINER_ENV = "RAZORPAY_MCP_CONTAINER"
-#: Toolsets enabled server-side (default ``orders,payments``).
-TOOLSETS_ENV = "RAZORPAY_MCP_TOOLSETS"
 
 #: Tools this provider refuses to run without. Checked against ``tools/list``.
 REQUIRED_TOOLS = frozenset({"create_order", "fetch_order"})
@@ -57,24 +53,8 @@ def _bridge_enabled() -> bool:
     return os.getenv(BRIDGE_ENV, "") == "1"
 
 
-def _bridge_argv(settings: PaymentSettings | None = None) -> list[str]:
-    """Builds the ``docker exec`` command; keys expand inside the container."""
-    cfg = settings or PaymentSettings.load()
-    return [
-        "docker",
-        "exec",
-        "-i",
-        cfg.mcp_container,
-        "sh",
-        "-c",
-        "exec ./razorpay-mcp-server stdio"
-        ' --key "$RAZORPAY_KEY_ID" --secret "$RAZORPAY_KEY_SECRET"'
-        f" --toolsets {cfg.mcp_toolsets}",
-    ]
-
-
 class RazorpayMcpProvider:
-    """Talks to the local ``razorpay-mcp`` container as an MCP client."""
+    """Talks to Razorpay's hosted remote MCP server as an MCP client."""
 
     name = "razorpay"
 
@@ -82,26 +62,29 @@ class RazorpayMcpProvider:
         self.settings = settings or PaymentSettings.load()
 
     def preflight(self) -> None:
-        """Enforces the live-key guard before any container is contacted."""
+        """Enforces the live-key guard before the remote server is contacted."""
         self.settings.require_razorpay()
 
     async def call_tool(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """Runs one MCP tool call inside a fully negotiated session."""
         self.preflight()
-        argv = _bridge_argv(self.settings)
         try:
-            from mcp import ClientSession, StdioServerParameters
-            from mcp.client.stdio import stdio_client
+            from mcp import ClientSession
+            from mcp.client.streamable_http import streamablehttp_client
         except ImportError as exc:  # pragma: no cover - dependency is in the lockfile
             raise PaymentConfigurationError(
                 "MCP bridge needs the `mcp` package."
             ) from exc
 
-        server = StdioServerParameters(command=argv[0], args=argv[1:])
         timeout = timedelta(seconds=self.settings.bridge_timeout)
         try:
             async with (
-                stdio_client(server) as (read, write),
+                streamablehttp_client(
+                    self.settings.mcp_url,
+                    headers={"Authorization": self.settings.mcp_auth_header},
+                    timeout=self.settings.timeout,
+                    sse_read_timeout=self.settings.bridge_timeout,
+                ) as (read, write, _get_session_id),
                 ClientSession(read, write, read_timeout_seconds=timeout) as session,
             ):
                 await session.initialize()
@@ -109,9 +92,10 @@ class RazorpayMcpProvider:
                 self._assert_tools(listing, tool)
                 resolved = _resolve_id_argument(listing, tool, arguments)
                 response = await session.call_tool(tool, resolved)
-        except FileNotFoundError as exc:
+        except (httpx.ConnectError, httpx.HTTPStatusError) as exc:
             raise PaymentConfigurationError(
-                "MCP bridge needs the `docker` CLI on PATH."
+                "Remote MCP server unreachable or unauthorized: "
+                f"{self.settings.redact(str(exc))[:300]}"
             ) from exc
         except (PaymentConfigurationError, ProviderUnknownError):
             raise
