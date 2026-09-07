@@ -1,4 +1,4 @@
-"""Production AI Chat Interface for Agentic Commerce with product image gallery."""
+"""LEGACY (not served): Gradio UI. Active frontend is FastAPI + web/."""
 
 import os
 import sys

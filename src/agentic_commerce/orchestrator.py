@@ -21,6 +21,8 @@ from agentic_commerce.core.models import (
     UCPOrder,
 )
 from agentic_commerce.core.runtime import run_async
+from agentic_commerce.payments.flow import authorize_payment
+from agentic_commerce.payments.models import PaymentResult
 from agentic_commerce.ucp.cart import _to_cart
 from agentic_commerce.ucp.client import ShopifyUcpClient, default_client
 
@@ -68,6 +70,25 @@ class CommerceOrchestrator:
             buyer_id=buyer_id,
         )
 
+    def charge(
+        self, mandate: dict[str, Any], cart: UCPCart, session_id: str = ""
+    ) -> PaymentResult:
+        """Authorizes the mandate through the payment flow's guards.
+
+        This is the step the agent runtime shares: the same guards (signature, expiry,
+        spending limit, cart, merchant, single use) run whether a payment starts here or
+        from a chat turn, so the pipeline and the LLM cannot diverge on what is allowed.
+        """
+        return run_async(
+            authorize_payment(
+                mandate,
+                session_id=session_id,
+                expected_cart_id=cart.id,
+                expected_merchant=cart.merchant_domain,
+                engine=self.engine,
+            )
+        )
+
     def settle(self, mandate: dict[str, Any]) -> dict[str, Any]:
         """Captures a verified mandate through the mock settlement gateway."""
         return self.gateway.capture(mandate)
@@ -106,6 +127,7 @@ class CommerceOrchestrator:
             amount_cents = self.negotiate(products[0])
 
         mandate = self.authorize_payment(cart, amount_cents=amount_cents, buyer_id=buyer_id)
+        payment = self.charge(mandate, cart, session_id=buyer_id)
         receipt = self.settle(mandate)
         order = self.place_order(cart, receipt)
 
@@ -113,6 +135,7 @@ class CommerceOrchestrator:
             "products": products,
             "cart": cart,
             "mandate": mandate,
+            "payment": payment,
             "receipt": receipt,
             "order": order,
         }

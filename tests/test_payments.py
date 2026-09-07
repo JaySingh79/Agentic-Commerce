@@ -1,7 +1,11 @@
-"""Tests for test-mode payment processing and provider selection.
+"""Tests for payment authorization, provider selection, and the safety guards.
 
-The production-key guard is a safety test: an autonomous agent must not be able
-to move real money, so live keys are refused outright.
+The production-key guard is a safety test: an autonomous agent must not be able to move
+real money, so live keys are refused outright.
+
+The fallback tests encode the rule that replaced "retry on any HTTPError": a provider is
+only swapped out for a failure that happened *before* anything was transmitted. A
+request that went out and was not answered is reconciled, never re-sent elsewhere.
 """
 
 import httpx
@@ -14,21 +18,19 @@ from agentic_commerce.backend.payments import (
     select_provider,
 )
 from agentic_commerce.core.runtime import run_async
-from agentic_commerce.payments import gateway as payment_gateway
-
-PAYMENT_ENV = (
-    "RAZORPAY_KEY_ID",
-    "RAZORPAY_KEY_SECRET",
-    "STRIPE_SECRET_KEY",
-    "STRIPE_API_KEY",
-)
+from agentic_commerce.payments.models import PaymentState
+from agentic_commerce.payments.providers import RazorpayProvider, StripeProvider
 
 
-@pytest.fixture(autouse=True)
-def clean_payment_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Isolates each test from any real credentials in the environment."""
-    for name in PAYMENT_ENV:
-        monkeypatch.delenv(name, raising=False)
+def _stub_result(provider: str, amount_cents: int, currency: str):
+    return payments.PaymentResult(
+        provider=provider,
+        status="created",
+        reference_id=f"{provider}_ref_1",
+        amount_cents=amount_cents,
+        currency=currency,
+        live=False,
+    )
 
 
 def test_defaults_to_simulated_without_credentials():
@@ -81,29 +83,93 @@ def test_live_key_degrades_to_simulated_rather_than_charging(monkeypatch: pytest
     assert result.live is False
 
 
-def test_razorpay_failure_falls_back_to_stripe(monkeypatch: pytest.MonkeyPatch):
+def test_unreachable_razorpay_falls_back_to_stripe(monkeypatch: pytest.MonkeyPatch):
+    """A connection that never opened cannot have created an order."""
     monkeypatch.setenv("RAZORPAY_KEY_ID", "rzp_test_abc")
     monkeypatch.setenv("RAZORPAY_KEY_SECRET", "secret")
     monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_abc")
 
-    async def _boom(*_args, **_kwargs):
+    async def _unreachable(self, amount_cents, currency, receipt):
         raise httpx.ConnectError("razorpay down")
 
-    async def _stripe_ok(amount_cents, currency, receipt):
-        return payments.PaymentResult(
-            provider="stripe",
-            status="requires_payment_method",
-            reference_id="pi_test_1",
-            amount_cents=amount_cents,
-            currency=currency,
-            live=False,
-        )
+    async def _stripe_ok(self, amount_cents, currency, receipt):
+        return _stub_result("stripe", amount_cents, currency)
 
-    monkeypatch.setattr(payment_gateway, "_charge_razorpay", _boom)
-    monkeypatch.setattr(payment_gateway, "_charge_stripe", _stripe_ok)
+    monkeypatch.setattr(RazorpayProvider, "create_order", _unreachable)
+    monkeypatch.setattr(StripeProvider, "create_order", _stripe_ok)
 
     result = run_async(process_payment(2400, "USD"))
     assert result.provider == "stripe"
+
+
+def test_transmitted_request_without_an_answer_is_never_retried_elsewhere(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The duplicate-charge case: a read timeout may already have created an order."""
+    monkeypatch.setenv("RAZORPAY_KEY_ID", "rzp_test_abc")
+    monkeypatch.setenv("RAZORPAY_KEY_SECRET", "secret")
+    monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_abc")
+    stripe_calls: list[int] = []
+
+    async def _timed_out(self, amount_cents, currency, receipt):
+        raise httpx.ReadTimeout("no answer")
+
+    async def _nothing_found(self, receipt):
+        return None
+
+    async def _stripe(self, amount_cents, currency, receipt):
+        stripe_calls.append(amount_cents)
+        return _stub_result("stripe", amount_cents, currency)
+
+    monkeypatch.setattr(RazorpayProvider, "create_order", _timed_out)
+    monkeypatch.setattr(RazorpayProvider, "find_by_receipt", _nothing_found)
+    monkeypatch.setattr(StripeProvider, "create_order", _stripe)
+
+    result = run_async(process_payment(2400, "INR", "rcpt-unknown"))
+    assert stripe_calls == []
+    assert result.state == PaymentState.UNKNOWN.value
+    assert result.status == "unknown"
+
+
+def test_unanswered_request_is_reconciled_when_the_order_exists(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """If the order did land, reconciliation adopts it instead of creating another."""
+    monkeypatch.setenv("RAZORPAY_KEY_ID", "rzp_test_abc")
+    monkeypatch.setenv("RAZORPAY_KEY_SECRET", "secret")
+
+    async def _timed_out(self, amount_cents, currency, receipt):
+        raise httpx.ReadTimeout("no answer")
+
+    async def _found(self, receipt):
+        return _stub_result("razorpay", 2400, "INR")
+
+    monkeypatch.setattr(RazorpayProvider, "create_order", _timed_out)
+    monkeypatch.setattr(RazorpayProvider, "find_by_receipt", _found)
+
+    result = run_async(process_payment(2400, "INR", "rcpt-reconcile"))
+    assert result.provider == "razorpay"
+    assert result.reference_id == "razorpay_ref_1"
+    assert result.state == PaymentState.AUTHORIZED.value
+
+
+def test_replaying_a_receipt_never_reaches_the_provider(monkeypatch: pytest.MonkeyPatch):
+    """``receipt`` is the idempotency key, and the ledger enforces it."""
+    monkeypatch.setenv("RAZORPAY_KEY_ID", "rzp_test_abc")
+    monkeypatch.setenv("RAZORPAY_KEY_SECRET", "secret")
+    calls: list[str] = []
+
+    async def _create(self, amount_cents, currency, receipt):
+        calls.append(receipt)
+        return _stub_result("razorpay", amount_cents, currency)
+
+    monkeypatch.setattr(RazorpayProvider, "create_order", _create)
+
+    first = run_async(process_payment(2400, "INR", "rcpt-once"))
+    second = run_async(process_payment(2400, "INR", "rcpt-once"))
+
+    assert calls == ["rcpt-once"]
+    assert second.reference_id == first.reference_id
 
 
 def test_both_providers_failing_still_yields_a_receipt(monkeypatch: pytest.MonkeyPatch):
@@ -111,11 +177,11 @@ def test_both_providers_failing_still_yields_a_receipt(monkeypatch: pytest.Monke
     monkeypatch.setenv("RAZORPAY_KEY_SECRET", "secret")
     monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_abc")
 
-    async def _boom(*_args, **_kwargs):
+    async def _unreachable(self, amount_cents, currency, receipt):
         raise httpx.ConnectError("down")
 
-    monkeypatch.setattr(payment_gateway, "_charge_razorpay", _boom)
-    monkeypatch.setattr(payment_gateway, "_charge_stripe", _boom)
+    monkeypatch.setattr(RazorpayProvider, "create_order", _unreachable)
+    monkeypatch.setattr(StripeProvider, "create_order", _unreachable)
 
     assert run_async(process_payment(2400, "USD")).provider == "simulated"
 
@@ -125,6 +191,17 @@ def test_non_positive_amount_is_rejected():
         run_async(process_payment(0, "USD"))
     with pytest.raises(ValueError, match="must be positive"):
         run_async(process_payment(-100, "USD"))
+
+
+def test_float_amounts_are_refused_rather_than_coerced():
+    """Money stays an integer count of minor units all the way down."""
+    with pytest.raises(ValueError, match="must be an int"):
+        run_async(process_payment(24.00, "USD"))
+
+
+def test_unknown_currency_is_rejected():
+    with pytest.raises(ValueError, match="unsupported currency"):
+        run_async(process_payment(2400, "XYZ"))
 
 
 def test_amount_display_uses_major_units():

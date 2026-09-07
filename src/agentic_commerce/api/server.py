@@ -7,11 +7,8 @@ layer wraps results in Markdown for the model to read — the objects underneath
 (``WebResult``, ``BestPick``, ``PaymentResult``, ``NegotiationResult``, UCP product
 dicts, signed AP2 mandates) are already JSON-shaped.
 
-The contract is documented in ``openapi.json`` at the repository root; each path
-there names the callable it backs onto.
-
-Threading: ``CommerceAgent.execute_stream`` is a blocking generator, so it is served
-through a Starlette ``StreamingResponse``, which drives sync iterators on a worker
+Threading: `CommerceAgent.execute_stream` is a blocking generator, so it is served
+through a `StreamingResponse`, which drives sync iterators on a worker
 thread. Tools reach the network through :func:`agentic_commerce.core.runtime.run_async`,
 which owns its own background event loop, so nothing here competes with uvicorn's.
 """
@@ -48,7 +45,16 @@ from agentic_commerce.backend.session_graph import (
 from agentic_commerce.backend.web_search import search_web
 from agentic_commerce.core.runtime import run_async
 from agentic_commerce.core.telemetry import get_latest_session_stats
+from agentic_commerce.payments.flow import (
+    MandateExpiredError,
+    MandateScopeError,
+    MandateTamperedError,
+    authorize_payment,
+)
 from agentic_commerce.ucp.client import ShopifyUcpClient
+from agentic_commerce.payments.ledger import MandateAlreadyUsedError, get_ledger
+from agentic_commerce.payments.providers.razorpay import verify_webhook_signature
+from agentic_commerce.payments.settings import PaymentSettings
 
 WEB_ROOT = Path(__file__).resolve().parents[3] / "web"
 
@@ -158,6 +164,22 @@ class PaymentRequest(BaseModel):
     currency: str = "USD"
     receipt: str | None = None
     session_id: str | None = None
+
+
+class AuthorizePaymentRequest(BaseModel):
+    """A charge authorized by a mandate the caller must present in full.
+
+    The mandate travels with the request rather than being looked up by id: the
+    signature is over the mandate's contents, so verifying what the caller actually
+    holds is the only check that means anything.
+    """
+
+    mandate: dict[str, Any]
+    session_id: str | None = None
+    amount_cents: int | None = Field(default=None, ge=1)
+    currency: str | None = None
+    expected_cart_id: str | None = None
+    expected_merchant: str | None = None
 
 
 # -------------------------------------------------------------------- helpers
@@ -656,6 +678,99 @@ def create_app(serve_frontend: bool = True) -> FastAPI:
         if request.session_id:
             get_or_create_session(request.session_id).update_payment(result)
         return result
+
+    @app.post("/api/payments/authorize")
+    def authorize_payment_route(request: AuthorizePaymentRequest) -> dict[str, Any]:
+        """Charges against an AP2 mandate, through every guard in the payment flow.
+
+        This is the mandate-gated path: signature, expiry, spending limit, currency,
+        cart, merchant and single-use are all checked before a provider is contacted,
+        and each refusal is reported as itself rather than as a generic "invalid".
+        ``/api/payments/test`` remains the mandate-free test endpoint.
+        """
+        session_id = request.session_id or ""
+        try:
+            result = run_async(
+                authorize_payment(
+                    request.mandate,
+                    session_id=session_id,
+                    amount_cents=request.amount_cents,
+                    currency=request.currency,
+                    expected_cart_id=request.expected_cart_id,
+                    expected_merchant=request.expected_merchant,
+                    engine=_ap2,
+                )
+            ).as_dict()
+        except MandateAlreadyUsedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except (MandateExpiredError, MandateTamperedError, MandateScopeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        if session_id:
+            get_or_create_session(session_id).update_payment(result)
+        return result
+
+    @app.get("/api/payments/{idempotency_key:path}")
+    def get_payment(idempotency_key: str) -> dict[str, Any]:
+        """Returns a recorded payment attempt, so a client can resolve an unknown.
+
+        A payment whose outcome was never confirmed is not a failure and not a success;
+        it is ``unknown`` until a webhook or a lookup says otherwise, and this is how a
+        client asks.
+        """
+        attempt = get_ledger().get(idempotency_key)
+        if attempt is None:
+            raise HTTPException(status_code=404, detail="unknown payment")
+        return {
+            "idempotency_key": attempt["idempotency_key"],
+            "state": attempt["state"],
+            "provider": attempt["provider"],
+            "amount_cents": attempt["amount_cents"],
+            "currency": attempt["currency"],
+            "reference_id": attempt["reference_id"] or None,
+            "mandate_id": attempt["mandate_id"] or None,
+            "result": attempt["result"],
+        }
+
+    @app.post("/api/payments/webhook/razorpay")
+    async def razorpay_webhook(http_request: Request) -> dict[str, Any]:
+        """Accepts a Razorpay webhook after verifying it against the raw body.
+
+        Terminal payment status is something only the provider knows; a create-order
+        response says an order exists, not that it was paid. The signature is checked
+        over the exact bytes received (re-serializing would change them), events are
+        deduplicated by id, and an unconfigured secret is a refusal rather than an
+        open door.
+        """
+        settings = PaymentSettings.load()
+        if not settings.razorpay_webhook_secret:
+            raise HTTPException(
+                status_code=503, detail="RAZORPAY_WEBHOOK_SECRET is not configured"
+            )
+
+        raw = await http_request.body()
+        signature = http_request.headers.get("X-Razorpay-Signature", "")
+        if not verify_webhook_signature(raw, signature, settings.razorpay_webhook_secret):
+            raise HTTPException(status_code=401, detail="signature verification failed")
+
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=400, detail="unparseable webhook body") from exc
+
+        event_id = str(
+            http_request.headers.get("X-Razorpay-Event-Id")
+            or payload.get("id")
+            or payload.get("event")
+            or ""
+        )
+        if not event_id:
+            raise HTTPException(status_code=400, detail="webhook carries no event id")
+
+        fresh = get_ledger().record_event(event_id, "razorpay", payload)
+        return {"received": True, "event_id": event_id, "duplicate": not fresh}
 
     @app.get("/api/telemetry/{session_id}")
     def get_telemetry(session_id: str) -> dict[str, Any]:

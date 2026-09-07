@@ -1,15 +1,21 @@
-# Entire project in one stack: FastAPI (8010, serves web/) + Gradio UI (7860)
-# + Razorpay MCP server (stdio, reached via `docker exec` bridge).
+# Entire project in one stack: FastAPI (8010, serves API + web/)
+# + Razorpay MCP server (stdio, reached via `docker exec` bridge)
+# + telemetry (OTLP collector / Tempo / Prometheus / Grafana :3000), folded in
+#   via `include:` below so one command brings up the whole stack.
+# LEGACY (retained, not served): Gradio UI (7860, `ui` service below).
 #
 # Usage:
-#   docker compose up -d --build     # everything
-#   docker compose logs -f api ui    # follow app logs
-#   docker compose -f docker-compose.yml -f docker-compose.telemetry.yml up -d
-#                                    # ...plus OTLP collector / Tempo / Prometheus / Grafana
+#   docker compose up -d --build          # everything, telemetry included
+#   docker compose logs -f api ui         # follow app logs
+#   docker compose up -d --build api ui razorpay-mcp
+#                                          # opt out of telemetry (lighter local run)
 #
 # Secrets are never baked into the image: they flow from `.env` via `env_file`.
 # Session snapshots live on the shared `session-data` volume so both frontends
 # read one durable session (mirrors local `.agentic_commerce/sessions.db`).
+include:
+  - docker-compose.telemetry.yml
+
 services:
   api:
     build: .
@@ -27,6 +33,10 @@ services:
       - HOST=0.0.0.0
       - API_PORT=8010
       - AC_SESSION_DB=/data/sessions.db
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+      # The payment ledger shares the session volume: idempotency and single-use
+      # mandates are worthless if the record dies with the container.
+      - AC_PAYMENTS_DB=/data/payments.db
       - RAZORPAY_MCP_BRIDGE=1
       - RAZORPAY_MCP_CONTAINER=agentic-commerce-razorpay-mcp
       - RAZORPAY_MCP_TOOLSETS=orders,payments
@@ -37,6 +47,8 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       - razorpay-mcp
+    cap_add:
+      - SYS_PTRACE  # TEMP: live py-spy diagnosis of checkout hang, revert after RCA
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8010/openapi.json')"]
       interval: 30s
@@ -44,6 +56,7 @@ services:
       retries: 3
       start_period: 60s
 
+  # LEGACY (retained, not served): Gradio UI kept for reference only.
   ui:
     build: .
     container_name: agentic-commerce-ui
@@ -59,6 +72,9 @@ services:
       - HOST=0.0.0.0
       - PORT=7860
       - AC_SESSION_DB=/data/sessions.db
+      # The payment ledger shares the session volume: idempotency and single-use
+      # mandates are worthless if the record dies with the container.
+      - AC_PAYMENTS_DB=/data/payments.db
       - RAZORPAY_MCP_BRIDGE=1
       - RAZORPAY_MCP_CONTAINER=agentic-commerce-razorpay-mcp
       - RAZORPAY_MCP_TOOLSETS=orders,payments

@@ -416,3 +416,109 @@ def test_a_second_search_in_one_turn_still_reports_its_scouts(
     crew = [e for e in events if e["type"] == "crew"]
 
     assert [e["detail"] for e in crew] == ["new"]
+
+
+# ------------------------------------------------- mandate-gated payment routes
+
+
+def _mandate(client: TestClient, amount_cents: int = 2400, **overrides) -> dict[str, Any]:
+    payload = {
+        "cart_id": "gid://shopify/Cart/1",
+        "amount_cents": amount_cents,
+        "currency": "INR",
+        "merchant_domain": "shop.example.com",
+        **overrides,
+    }
+    return client.post("/api/mandate", json=payload).json()
+
+
+def test_authorize_requires_a_mandate_that_verifies(client: TestClient):
+    mandate = _mandate(client)
+    response = client.post("/api/payments/authorize", json={"mandate": mandate})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["live"] is False
+    assert body["state"] == "authorized"
+    assert body["mandate_id"] == mandate["mandate_id"]
+
+
+def test_authorize_rejects_a_tampered_mandate(client: TestClient):
+    mandate = _mandate(client)
+    mandate["merchant_domain"] = "attacker.example.com"
+    response = client.post("/api/payments/authorize", json={"mandate": mandate})
+
+    assert response.status_code == 400
+    assert "signature" in response.json()["detail"]
+
+
+def test_authorize_rejects_a_charge_beyond_the_mandate(client: TestClient):
+    mandate = _mandate(client)
+    response = client.post(
+        "/api/payments/authorize", json={"mandate": mandate, "amount_cents": 999_999}
+    )
+
+    assert response.status_code == 400
+    assert "spending limit" in response.json()["detail"]
+
+
+def test_a_mandate_can_only_authorize_once(client: TestClient):
+    mandate = _mandate(client)
+    assert client.post("/api/payments/authorize", json={"mandate": mandate}).status_code == 200
+
+    second = client.post(
+        "/api/payments/authorize", json={"mandate": mandate, "session_id": "other"}
+    )
+    assert second.status_code == 409
+
+
+def test_payment_lookup_reports_the_recorded_state(client: TestClient):
+    mandate = _mandate(client)
+    authorized = client.post("/api/payments/authorize", json={"mandate": mandate}).json()
+
+    looked_up = client.get(f"/api/payments/{authorized['idempotency_key']}")
+    assert looked_up.status_code == 200
+    assert looked_up.json()["state"] == "authorized"
+    assert looked_up.json()["mandate_id"] == mandate["mandate_id"]
+
+
+def test_unknown_payment_lookup_is_a_404(client: TestClient):
+    assert client.get("/api/payments/never-happened").status_code == 404
+
+
+def test_webhook_without_a_configured_secret_is_refused(client: TestClient):
+    response = client.post("/api/payments/webhook/razorpay", json={"event": "order.paid"})
+    assert response.status_code == 503
+
+
+def test_webhook_signature_is_verified_over_the_raw_body(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    import hashlib
+    import hmac
+
+    monkeypatch.setenv("RAZORPAY_WEBHOOK_SECRET", "whsec_test")
+    body = json.dumps({"id": "evt_1", "event": "order.paid"}).encode()
+    signature = hmac.new(b"whsec_test", body, hashlib.sha256).hexdigest()
+
+    bad = client.post(
+        "/api/payments/webhook/razorpay",
+        content=body,
+        headers={"X-Razorpay-Signature": "deadbeef", "content-type": "application/json"},
+    )
+    assert bad.status_code == 401
+
+    good = client.post(
+        "/api/payments/webhook/razorpay",
+        content=body,
+        headers={"X-Razorpay-Signature": signature, "content-type": "application/json"},
+    )
+    assert good.status_code == 200
+    assert good.json() == {"received": True, "event_id": "evt_1", "duplicate": False}
+
+    replay = client.post(
+        "/api/payments/webhook/razorpay",
+        content=body,
+        headers={"X-Razorpay-Signature": signature, "content-type": "application/json"},
+    )
+    assert replay.json()["duplicate"] is True

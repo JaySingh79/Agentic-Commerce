@@ -968,6 +968,175 @@
           }
         }
       }
+    },
+    "/api/payments/authorize": {
+      "post": {
+        "tags": [
+          "payments"
+        ],
+        "operationId": "authorizePayment",
+        "summary": "Authorize a payment against an AP2 mandate.",
+        "description": "The mandate-gated payment path. Every guard runs before a provider is contacted: signature, expiry, spending limit, currency, cart, merchant, and single use. Each refusal is reported as itself — `400` for expired, tampered or out-of-scope, `409` for a mandate that has already authorized a payment — because 'invalid' tells a shopper nothing.\n\n**Safety guard:** unchanged. Only test keys are accepted; the response's `live` is derived from the credential mode, never asserted by a provider.",
+        "x-backs-onto": "agentic_commerce.payments.flow.authorize_payment",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuthorizePaymentRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Authorization receipt.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaymentResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Mandate expired, tampered, or outside its authorized scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Mandate has already authorized a payment.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/payments/{idempotency_key}": {
+      "get": {
+        "tags": [
+          "payments"
+        ],
+        "operationId": "getPayment",
+        "summary": "Look up a recorded payment attempt.",
+        "description": "How a client resolves an `unknown` outcome without re-sending a payment.",
+        "x-backs-onto": "agentic_commerce.payments.ledger.PaymentLedger.get",
+        "parameters": [
+          {
+            "name": "idempotency_key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The recorded attempt.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaymentAttempt"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such payment attempt.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/payments/webhook/razorpay": {
+      "post": {
+        "tags": [
+          "payments"
+        ],
+        "operationId": "razorpayWebhook",
+        "summary": "Receive a Razorpay webhook.",
+        "description": "Terminal payment status is something only the provider knows: a created order is not a paid one. The `X-Razorpay-Signature` header is verified over the exact raw body with `RAZORPAY_WEBHOOK_SECRET`, and events are deduplicated by id. An unconfigured secret answers `503` rather than accepting unauthenticated state changes.",
+        "x-backs-onto": "agentic_commerce.payments.providers.razorpay.verify_webhook_signature",
+        "parameters": [
+          {
+            "name": "X-Razorpay-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Event accepted (or recognised as a duplicate).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookAck"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unparseable body or missing event id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Signature verification failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No webhook secret configured.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1767,6 +1936,33 @@
               "null"
             ],
             "format": "uri"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "authorized",
+              "captured",
+              "settled",
+              "failed",
+              "expired",
+              "unknown"
+            ],
+            "description": "Ledger state. `unknown` means the request was transmitted but never answered; it is neither a success nor a failure until reconciliation or a webhook resolves it."
+          },
+          "idempotency_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Replaying a request with this key returns this same result without contacting a provider."
+          },
+          "mandate_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The AP2 mandate that authorized the charge, when one did."
           }
         }
       },
@@ -2607,6 +2803,117 @@
                 "$ref": "#/components/schemas/PaymentResult"
               }
             ]
+          }
+        }
+      },
+      "AuthorizePaymentRequest": {
+        "type": "object",
+        "required": [
+          "mandate"
+        ],
+        "description": "A charge authorized by a mandate presented in full: the signature covers the mandate's contents, so only the caller's actual copy can be verified.",
+        "properties": {
+          "mandate": {
+            "$ref": "#/components/schemas/Mandate"
+          },
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "amount_cents": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1,
+            "description": "Optional; defaults to the mandate's amount and may never exceed its spending limit."
+          },
+          "currency": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional; must match the mandate's currency."
+          },
+          "expected_cart_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expected_merchant": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "PaymentAttempt": {
+        "type": "object",
+        "required": [
+          "idempotency_key",
+          "state"
+        ],
+        "properties": {
+          "idempotency_key": {
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/PaymentResult/properties/state"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "amount_cents": {
+            "type": "integer"
+          },
+          "currency": {
+            "type": "string"
+          },
+          "reference_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mandate_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "result": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PaymentResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "WebhookAck": {
+        "type": "object",
+        "required": [
+          "received",
+          "event_id",
+          "duplicate"
+        ],
+        "properties": {
+          "received": {
+            "type": "boolean"
+          },
+          "event_id": {
+            "type": "string"
+          },
+          "duplicate": {
+            "type": "boolean",
+            "description": "True when this event id was already recorded; handling is idempotent."
           }
         }
       }

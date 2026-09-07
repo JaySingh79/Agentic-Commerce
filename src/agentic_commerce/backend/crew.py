@@ -35,7 +35,11 @@ from agentic_commerce.a2a.buyer_agent import BuyerAgent
 from agentic_commerce.a2a.merchant_agent import MerchantAgent
 from agentic_commerce.a2a.negotiation import NegotiationResult, negotiate
 from agentic_commerce.backend.analyst import BestPick, pick_best
-from agentic_commerce.backend.payments import PaymentResult, process_payment
+from agentic_commerce.backend.payments import (
+    PaymentResult,
+    authorize_payment,
+    process_payment,
+)
 from agentic_commerce.backend.web_search import WebResult, search_web
 from agentic_commerce.core.runtime import run_async
 from agentic_commerce.core.telemetry import trace_tool_execution
@@ -230,11 +234,48 @@ class CommerceCrew:
     def run_payment(
         self, amount_cents: int, currency: str = "USD", receipt: str | None = None
     ) -> PaymentResult:
-        """Captures a test-mode payment through the configured provider."""
+        """Authorizes a test-mode payment through the configured provider.
+
+        Unmandated: this is the raw provider path, kept for the ``/api/payments/test``
+        endpoint. Anything driven by the agent goes through :meth:`run_authorization`
+        so an AP2 mandate actually authorizes the charge.
+        """
         with trace_tool_execution(
             "crew_payment", {"amount_cents": amount_cents, "currency": currency}
         ):
             return run_async(process_payment(amount_cents, currency, receipt))
+
+    def run_authorization(
+        self,
+        mandate: dict[str, Any],
+        session_id: str = "",
+        amount_cents: int | None = None,
+        currency: str | None = None,
+        expected_cart_id: str | None = None,
+        expected_merchant: str | None = None,
+        engine: Any = None,
+    ) -> PaymentResult:
+        """Authorizes a charge against a signed, unspent, in-scope AP2 mandate.
+
+        ``engine`` must be the AP2 engine that signed the mandate; verification is
+        meaningless against a different key.
+        """
+        with trace_tool_execution(
+            "crew_authorization",
+            {"mandate_id": str(mandate.get("mandate_id", "")), "currency": currency or ""},
+            session_id=session_id or None,
+        ):
+            return run_async(
+                authorize_payment(
+                    mandate,
+                    session_id=session_id,
+                    amount_cents=amount_cents,
+                    currency=currency,
+                    expected_cart_id=expected_cart_id,
+                    expected_merchant=expected_merchant,
+                    engine=engine,
+                )
+            )
 
 
 def stream_events(events: list[CrewEvent]) -> Iterator[dict[str, Any]]:

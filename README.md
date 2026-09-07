@@ -2,10 +2,10 @@
 
 An autonomous e-commerce agent platform: natural-language product discovery over
 Shopify's **Universal Commerce Protocol (UCP)**, A2A buyer/merchant negotiation,
-AP2 payment mandates, and test-mode payment capture — behind two coexisting
-frontends and one typed HTTP API.
+AP2 payment mandates, and test-mode payment capture — behind one typed HTTP API
+and the vanilla-JS storefront it serves (Gradio is legacy, retained but not served).
 
-**Entrances:** Gradio chat on `http://localhost:7860` · vanilla-JS storefront + HTTP API on `http://localhost:8010` (served by the same FastAPI process).
+**Entrances:** vanilla-JS storefront + HTTP API on `http://localhost:8010` (served by the same FastAPI process; Gradio chat on `http://localhost:7860` is legacy).
 
 ---
 
@@ -72,38 +72,42 @@ MCP tool glossary) and `project_context.md` (endpoints, key files).
 
 ```bash
 docker compose up -d --build
-# Gradio chat .... http://localhost:7860
 # API + web UI ... http://localhost:8010
-docker compose logs -f api ui
+# LEGACY (not served): Gradio chat was http://localhost:7860
+# Telemetry included: Grafana http://localhost:3000 · Prometheus http://localhost:9090
+docker compose logs -f api
 ```
 
-This starts `api`, `ui`, and a compose-managed `razorpay-mcp` container
-(`agentic-commerce-razorpay-mcp`, so it never clashes with a standalone one).
-With telemetry:
+This starts `api`, a compose-managed `razorpay-mcp` container
+(`agentic-commerce-razorpay-mcp`, so it never clashes with a standalone one),
+and the telemetry stack (`docker-compose.telemetry.yml`, folded in via
+`include:`) — one command, everything up
+(LEGACY `ui`/Gradio service retained in compose but not served).
+
+To skip telemetry for a lighter local run, name the services explicitly:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.telemetry.yml up -d
-# Grafana http://localhost:3000 · Prometheus http://localhost:9090
+docker compose up -d --build api ui razorpay-mcp
 ```
 
 ### Option B — local processes
 
 ```bash
 uv sync
-uv run python -m agentic_commerce.api.server  # API + web UI on :8010
-uv run python app.py                           # Gradio chat on :7860
+uv run python -m agentic_commerce.api.server  # API + web UI on :8010 (active)
+# LEGACY (not served): uv run python app.py  # Gradio chat was on :7860
 ```
 
-`HOST`/`PORT` (Gradio) and `HOST`/`API_PORT` (API) are env-overridable; both
-default to `127.0.0.1`.
+`HOST`/`API_PORT` (API) are env-overridable; default `127.0.0.1` / `8010`
+(legacy Gradio `HOST`/`PORT :7860` retired).
 
 ### Verify your setup
 
 ```bash
 uv run ruff check src tests   # lint: clean
-uv run pytest -q              # 213 passed, ~60s, across 23 test files
+uv run pytest -q              # 265 passed, ~65s, across 26 test files
 curl http://localhost:8010/openapi.json | head -c 200   # API alive
-curl -o /dev/null -w "%{http_code}" http://localhost:7860/  # UI alive → 200
+curl -o /dev/null -w "%{http_code}" http://localhost:8010/  # web UI alive → 200
 ```
 
 ---
@@ -157,7 +161,7 @@ autonomous agent must never move real money.
 
 ## 4. The HTTP API
 
-21 paths, documented in `openapi.json` (OpenAPI 3.1.0, hand-kept in sync —
+24 paths, documented in `openapi.json` (OpenAPI 3.1.0, hand-kept in sync —
 every `$ref` resolves, every path maps to a real callable). Groups:
 
 | Group | Endpoints |
@@ -167,7 +171,7 @@ every `$ref` resolves, every path maps to a real callable). Groups:
 | Cart & checkout | `POST /api/cart`, `GET/PUT /api/cart/{id}` (PUT is full replacement), `POST /api/checkout` |
 | Negotiation | `POST /api/negotiate` |
 | Mandates | `POST /api/mandate`, `POST /api/mandate/verify` |
-| Payments (test-mode) | `POST /api/payments/test` |
+| Payments (test-mode) | `POST /api/payments/test` (mandate-free), `POST /api/payments/authorize` (mandate-gated), `GET /api/payments/{idempotency_key}`, `POST /api/payments/webhook/razorpay` |
 | Session & introspection | `POST /api/session`, `GET /api/session/{id}`, `GET /api/session/{id}/results`, `GET /api/session/{id}/graph`, `GET /api/telemetry/{id}`, `GET /api/health` |
 
 The streaming vocabulary (`status`, `content`, `tool_call`, `tool_result`,
@@ -192,8 +196,11 @@ All via environment (`.env` locally, `env_file` in compose):
 | `RAZORPAY_MCP_BRIDGE=1` | Route Razorpay orders through the local MCP container | off (direct REST) |
 | `RAZORPAY_MCP_CONTAINER` / `RAZORPAY_MCP_TOOLSETS` | Bridge target and server-side tool scope | `razorpay-mcp` / `orders,payments` |
 | `TAVILY_API_KEY` | Web search provider (else DuckDuckGo) | — |
+| `RAZORPAY_WEBHOOK_SECRET` | Verifies `X-Razorpay-Signature` on `/api/payments/webhook/razorpay`; unset = the route refuses with `503` | — |
+| `AC_PAYMENTS_PERSIST` / `AC_PAYMENTS_DB` | Payment ledger (idempotency, mandate single-use, webhook dedupe) on/off + path | on / `.agentic_commerce/payments.db` (compose: `/data/payments.db`) |
+| `AC_PAYMENTS_STRICT` | Refuse the built-in placeholder AP2 signing key when no `CLIENT_SECRET` is set | off |
 | `AC_SESSION_PERSIST` / `AC_SESSION_DB` | SQLite session snapshots on/off + path | on / `.agentic_commerce/sessions.db` (compose: `/data/sessions.db` shared volume) |
-| `HOST` / `PORT` / `API_PORT` | Bind host + Gradio/API ports | `127.0.0.1` / `7860` / `8010` |
+| `HOST` / `API_PORT` | Bind host + API port (single FastAPI port) | `127.0.0.1` / `8010` (legacy Gradio `PORT 7860` retired) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_SDK_DISABLED` | Telemetry export | `http://localhost:4318` / enabled |
 
 ---
@@ -213,25 +220,41 @@ All via environment (`.env` locally, `env_file` in compose):
 
 ### Add a payment capability
 
-`payments/` is the home: `config.py` (env/guard/selection), `razorpay.py`
-(REST + HMAC verifies), `mcp.py` (container bridge), `gateway.py`
-(orchestration), `models.py` (`PaymentResult`). Rules:
+`payments/` is the home: `settings.py` (env, the single guard site, `live` derivation),
+`models.py` (states, error taxonomy, `PaymentResult`), `ledger.py` (idempotency,
+mandate claims, webhook dedupe), `providers/` (`razorpay.py`, `stripe.py`,
+`simulated.py`, `mcp.py` behind one protocol), `gateway.py` (provider resolution and
+reconciliation), `flow.py` (the mandate-gated state machine). `config.py`, `razorpay.py`
+and `mcp.py` at the package root are compatibility shims. Rules:
 
 - Raw `httpx` — **no payment SDK becomes a dependency** (project decision).
 - Every receipt states `live`; test keys only (`rzp_test_*`, `sk_test_*`).
 - `backend/payments.py` stays a re-export shim — update it when you add a
   public name so `crew`/`tools`/`server` imports keep working.
-- Razorpay has no idempotency header: `receipt` **is** the dedupe key.
+- Razorpay has no idempotency header, so the **ledger** (`payments/ledger.py`) is the
+  dedupe: an attempt row is written before the provider call and a repeated key returns
+  the stored result without contacting anyone.
+- A provider is only swapped out for a failure that happened *before* transmission. A
+  request that went out and was not answered becomes `PaymentState.UNKNOWN` and is
+  resolved by `find_by_receipt`, never by a retry elsewhere — that is how one shopper
+  action stops being able to create two orders.
+- Charges go through `payments/flow.py`, not straight to `process_payment`: a signed,
+  unexpired, in-scope, unspent AP2 mandate authorizes exactly one payment.
 
 ### Extend the MCP bridge
 
-`payments/mcp.py` speaks JSON-RPC over `docker exec -i` stdio because the
-`razorpay/mcp` image is stdio-only. To expose more tools (refunds, payment
-links, settlements — all present in the container's `tools/list`), add a thin
-`mcp_<thing>` wrapper mapping `content[0].text` JSON onto `PaymentResult` and
-cover it with a hermetic test (fake `subprocess.run`, see
-`tests/test_payments_mcp.py`). Live-container checks stay manual and
-read-only where possible (`fetch_*` before any write).
+`payments/providers/mcp.py` is a real MCP client (`mcp.ClientSession` over a
+`docker exec -i` stdio transport, because the `razorpay/mcp` image is stdio-only): it
+completes the `initialize` handshake before calling anything, asserts the tools it needs
+appear in `tools/list`, resolves each tool's id argument from that tool's own
+`inputSchema`, and enforces a per-request timeout. **It is a development path** — a host
+Docker socket is not a production transport — and when `RAZORPAY_MCP_BRIDGE=1` a bridge
+failure is raised rather than degraded to REST, because both paths create orders.
+
+To expose more tools (refunds, payment links, settlements), add a method that calls
+`call_tool` and maps the JSON onto `PaymentResult`, and cover it with a hermetic test
+(fake `stdio_client`/`ClientSession`, see `tests/test_payments_mcp.py`). Live-container
+checks stay manual and read-only where possible (`fetch_*` before any write).
 
 ### Build a third frontend
 
@@ -256,7 +279,7 @@ review counts labelled popularity, never sales.
 
 ```bash
 uv run ruff check src tests          # E,F,I,UP,B,SIM · line-length 100
-uv run pytest -q                     # 213 passed · 23 files · ~60s
+uv run pytest -q                     # 265 passed · 26 files · ~65s
 uv run pytest tests/test_payments.py tests/test_payments_mcp.py -q
 ```
 
@@ -273,9 +296,10 @@ may change only as an explicitly declared contract change. Browser JS
 ## 8. Docker reference
 
 ```bash
-docker compose up -d --build        # api :8010 · ui :7860 · razorpay-mcp (stdio)
-docker compose ps                   # all three healthy
-docker compose logs -f api ui
+docker compose up -d --build        # api :8010 · razorpay-mcp (stdio) · telemetry :3000/:9090; ui :7860 is LEGACY
+docker compose up -d --build api ui razorpay-mcp   # opt out of telemetry
+docker compose ps                   # api + razorpay-mcp + telemetry stack healthy
+docker compose logs -f api
 docker compose down                 # stack down; session-data volume persists
 ```
 
@@ -296,15 +320,26 @@ docker compose down                 # stack down; session-data volume persists
 ## 9. Safety model (read this before touching payments)
 
 1. **Test keys only.** `rzp_test_*` / `sk_test_*`; anything else raises
-   `PaymentConfigurationError`. Stripe PaymentIntents are created, never
-   confirmed; Razorpay Orders are created, never paid. **Nothing in this repo
-   moves money, including in test mode.**
-2. **Honesty is structural.** Missing data is absent (no rating key, no cart
+   `PaymentConfigurationError`. The guard lives in exactly one place
+   (`payments/settings.py`), and `PaymentResult.live` is *derived* from the credential
+   mode rather than written as a literal by each provider. Stripe PaymentIntents are
+   created, never confirmed; Razorpay Orders are created, never paid; capture is
+   implemented, tested, and switched off (`CaptureNotEnabledError`). **Nothing in this
+   repo moves money, including in test mode.**
+2. **A mandate authorizes the charge.** `payments/flow.py` verifies the AP2 signature
+   (now over the whole payload, so `merchant_domain`, `buyer_id` and
+   `spending_limit_cents` can no longer be edited in flight), checks expiry, limit,
+   currency, cart and merchant, then claims the mandate in the ledger so it can
+   authorize exactly one payment. The refusals are distinct: expired, tampered,
+   out-of-scope and already-spent are different answers.
+3. **Honesty is structural.** Missing data is absent (no rating key, no cart
    button, `live` always present) so no model paraphrase can turn a caveat
-   into a claim.
-3. **Independent failure.** Either scout, either payment provider can fail and
-   the turn degrades with the gap named — never a silent total failure.
-4. **Sessions are bearer capabilities** (`ac_session` cookie + header +
+   into a claim. An unconfirmed payment reports `state: "unknown"` rather than
+   guessing in either direction.
+4. **Independent failure.** Either scout can fail and the turn degrades with the gap
+   named. Payment fallback is narrower on purpose: only a pre-transmission failure
+   licenses another provider.
+5. **Sessions are bearer capabilities** (`ac_session` cookie + header +
    `localStorage`) over plain HTTP — fine for local dev, not a production
    auth story (see `FEATURES.md` §7).
 

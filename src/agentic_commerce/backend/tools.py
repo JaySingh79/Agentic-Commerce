@@ -380,18 +380,23 @@ def make_commerce_tools(session_id: str = DEFAULT_SESSION_ID) -> list[BaseTool]:
 
     @tool
     def process_test_payment(
-        amount_cents: int, currency: str = "USD", cart_id: str = ""
+        amount_cents: int = 0, currency: str = "", cart_id: str = ""
     ) -> str:
-        """Capture a test-mode payment for an authorized cart or AP2 mandate.
+        """Authorize a test-mode payment against the session's active AP2 mandate.
+
+        A mandate must exist first — call `generate_ap2_mandate` before this. The
+        mandate decides the amount, currency, cart and merchant; the arguments here can
+        only narrow the charge, never widen it past what the shopper authorized. A
+        mandate authorizes exactly one payment.
 
         Routes to Razorpay when configured, otherwise Stripe, otherwise a clearly
         labelled simulated gateway. Never charges real money: only test keys are
         accepted.
 
         Args:
-            amount_cents: Amount in minor units (cents/paise), e.g. 2400 for $24.00.
-            currency: 3-letter currency code (default 'USD'; use 'INR' for Razorpay).
-            cart_id: Optional cart reference used as the payment receipt label.
+            amount_cents: Optional amount in minor units; defaults to the mandate's.
+            currency: Optional 3-letter code; must match the mandate's currency.
+            cart_id: Optional cart the payment must belong to.
         """
         try:
             with trace_tool_execution(
@@ -399,12 +404,22 @@ def make_commerce_tools(session_id: str = DEFAULT_SESSION_ID) -> list[BaseTool]:
                 {"amount_cents": amount_cents, "currency": currency},
                 session_id=session_id,
             ):
-                result = _crew.run_payment(
-                    amount_cents=amount_cents,
-                    currency=currency,
-                    receipt=cart_id or None,
+                session = _session()
+                mandate = session.active_mandate
+                if not mandate:
+                    return (
+                        "⚠️ **No payment mandate.** Nothing is authorized to be charged "
+                        "yet — generate an AP2 mandate for this cart first, then retry."
+                    )
+                result = _crew.run_authorization(
+                    mandate,
+                    session_id=session_id,
+                    amount_cents=amount_cents or None,
+                    currency=currency or None,
+                    expected_cart_id=cart_id or None,
+                    engine=_ap2_engine,
                 )
-                _session().update_payment(result.as_dict())
+                session.update_payment(result.as_dict())
                 return result.format_display()
         except Exception as e:
             return f"Payment error: {e}"

@@ -45,7 +45,7 @@ class FakeLLM:
         self._turns = list(turns)
         self.calls = 0
 
-    def stream(self, messages: Any):
+    def stream(self, messages: Any, **kwargs: Any):
         self.calls += 1
         turn = self._turns[min(self.calls - 1, len(self._turns) - 1)]
         yield from turn
@@ -105,7 +105,7 @@ def test_tools_still_run_after_leading_text(agent: CommerceAgent):
 
 def test_a_model_failure_surfaces_instead_of_vanishing(agent: CommerceAgent):
     class BoomLLM:
-        def stream(self, messages: Any):
+        def stream(self, messages: Any, **kwargs: Any):
             raise RuntimeError("model unavailable")
             yield  # pragma: no cover - generator marker
 
@@ -115,3 +115,29 @@ def test_a_model_failure_surfaces_instead_of_vanishing(agent: CommerceAgent):
 
     assert events, "a failed turn produced no events at all"
     assert any("unavailable" in str(e.get("text", "")) for e in events)
+
+
+def test_stream_calls_carry_a_timeout(agent: CommerceAgent):
+    """A stalled Gemini response must not hang execute_stream forever.
+
+    Without a call-time timeout, `self.llm.stream(messages)` can block
+    indefinitely with nothing above it to interrupt it (see RCA in
+    docs/architectural-workflow.md). This asserts every stream call actually
+    carries the agent's timeout, and that a timeout raised mid-stream is
+    caught by the existing fallback path instead of propagating as a hang.
+    """
+    seen_timeouts: list[Any] = []
+
+    class TimeoutLLM:
+        def stream(self, messages: Any, **kwargs: Any):
+            seen_timeouts.append(kwargs.get("timeout"))
+            raise TimeoutError("deadline exceeded")
+            yield  # pragma: no cover - generator marker
+
+    agent.llm = TimeoutLLM()
+
+    events = list(agent.execute_stream("checkout"))
+
+    assert seen_timeouts, "stream() was never called"
+    assert all(t == CommerceAgent.LLM_TIMEOUT_SECONDS for t in seen_timeouts)
+    assert events, "a timed-out turn produced no events at all (would hang the UI)"

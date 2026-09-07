@@ -1,4 +1,4 @@
-# Single image for both frontends: FastAPI (8010, serves web/) and Gradio (7860).
+# Single image: FastAPI (8010, serves API + web/). Gradio (7860) is LEGACY, retained but not served.
 # Deps via uv (mirrors AGENTS.md: uv for everything). No secrets baked in —
 # runtime config flows through compose `env_file: .env`. Docker CLI is included
 # so payments/mcp.py can bridge to the razorpay-mcp container via `docker exec`.

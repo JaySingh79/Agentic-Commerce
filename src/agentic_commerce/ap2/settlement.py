@@ -12,6 +12,7 @@ from typing import Any
 
 from agentic_commerce.ap2.mandate import AP2Engine
 from agentic_commerce.core.models import MandateStatus
+from agentic_commerce.payments.ledger import MandateAlreadyUsedError, get_ledger
 
 
 class SettlementError(RuntimeError):
@@ -29,13 +30,23 @@ class MockSettlementGateway:
         """Verifies a mandate then records a settlement receipt in the ledger.
 
         Returns the receipt (with ``status`` ``SETTLED``). Raises
-        :class:`SettlementError` if the mandate signature/expiry is invalid.
+        :class:`SettlementError` if the mandate signature/expiry is invalid, or if the
+        mandate has already been settled — an authorization is spent once, and that has
+        to be enforced in the database rather than by a list this process happens to
+        hold, or two concurrent captures both "win".
         """
         if not self.engine.verify_mandate(mandate):
             raise SettlementError("Mandate verification failed; refusing to settle.")
 
+        mandate_id = str(mandate.get("mandate_id") or "")
+        settlement_id = f"stl_{uuid.uuid4().hex[:16]}"
+        try:
+            get_ledger().claim_mandate(mandate_id, settlement_id, purpose="settlement")
+        except MandateAlreadyUsedError as exc:
+            raise SettlementError(str(exc)) from exc
+
         receipt = {
-            "settlement_id": f"stl_{uuid.uuid4().hex[:16]}",
+            "settlement_id": settlement_id,
             "mandate_id": mandate.get("mandate_id"),
             "cart_id": mandate.get("cart_id"),
             "amount_cents": mandate.get("amount_cents", 0),

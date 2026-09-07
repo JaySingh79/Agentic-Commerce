@@ -1,13 +1,21 @@
-"""Phase 4: AP2 Payment Mandate Engine.
+"""AP2 Payment Mandate engine: sign, verify, and refuse.
 
-Provides cryptographically verifiable payment authorization mandates using
-HMAC-SHA256 signing over a canonical mandate string, with tamper detection and
-expiry validation. Behavior is intentionally identical to the original
-``backend/ap2.py`` (which now re-exports from here).
+A mandate is the only thing standing between an autonomous agent and a charge, so the
+signature has to cover the *whole* authorization. The previous canonical string signed
+five fields — ``mandate_id:cart_id:amount_cents:currency:expires_at`` — which left
+``merchant_domain``, ``buyer_id`` and ``spending_limit_cents`` unsigned: an attacker (or
+a confused agent) could redirect a valid mandate to a different merchant, or raise its
+spending limit, without breaking verification.
+
+Signing is now HMAC-SHA256 over canonical JSON of every field except ``signature``:
+sorted keys, no whitespace, so the bytes are reproducible and no field is left out by
+construction. Mandates live for an hour, so no migration path is needed for the old
+scheme — ``ap2_version`` is bumped and the old format simply stops verifying.
 """
 
 import hashlib
 import hmac
+import json
 import os
 import time
 import uuid
@@ -16,12 +24,28 @@ from typing import Any
 # Status literals kept as module constants; also mirrored by core.models.MandateStatus.
 STATUS_PENDING = "AUTHORIZED_PENDING_SETTLEMENT"
 
+#: Bumped when the signing scheme changed from a 5-field string to canonical JSON.
+AP2_VERSION = "2026-09-01"
+
+#: The placeholder key the engine used when nothing was configured. Signing real
+#: authorizations with a constant published in this repository is not a signature.
+_INSECURE_DEFAULT_SECRET = "ap2_default_secret_key"
+
+
+class MandateConfigurationError(RuntimeError):
+    """Raised when the engine is asked to sign with an unusable key."""
+
 
 class AP2Engine:
     """Generates, signs, and validates Agent Payment Protocol (AP2) payment mandates."""
 
     def __init__(self, secret_key: str | None = None):
-        self.secret_key = secret_key or os.getenv("CLIENT_SECRET") or "ap2_default_secret_key"
+        self.secret_key = secret_key or os.getenv("CLIENT_SECRET") or _INSECURE_DEFAULT_SECRET
+        if self.secret_key == _INSECURE_DEFAULT_SECRET and _strict():
+            raise MandateConfigurationError(
+                "AC_PAYMENTS_STRICT is set but no CLIENT_SECRET is configured; "
+                "refusing to sign mandates with the built-in placeholder key."
+            )
 
     def create_payment_mandate(
         self,
@@ -38,7 +62,7 @@ class AP2Engine:
         expires_at = now + max_duration_seconds
 
         mandate_payload = {
-            "ap2_version": "2026-04-08",
+            "ap2_version": AP2_VERSION,
             "mandate_id": mandate_id,
             "buyer_id": buyer_id,
             "cart_id": cart_id,
@@ -50,39 +74,25 @@ class AP2Engine:
             "status": STATUS_PENDING,
             "spending_limit_cents": amount_cents,
         }
-
-        # Cryptographic signature
-        canonical = f"{mandate_id}:{cart_id}:{amount_cents}:{currency}:{expires_at}"
-        signature = hmac.new(
-            self.secret_key.encode("utf-8"),
-            canonical.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-
-        mandate_payload["signature"] = signature
+        mandate_payload["signature"] = self.sign(mandate_payload)
         return mandate_payload
 
-    def verify_mandate(self, mandate: dict[str, Any]) -> bool:
-        """Verifies the integrity and validity of an AP2 mandate."""
-        now = int(time.time())
-        if mandate.get("expires_at", 0) < now:
-            return False
-
-        mandate_id = mandate.get("mandate_id", "")
-        cart_id = mandate.get("cart_id", "")
-        amount_cents = mandate.get("amount_cents", 0)
-        currency = mandate.get("currency", "USD")
-        expires_at = mandate.get("expires_at", 0)
-        provided_sig = mandate.get("signature", "")
-
-        canonical = f"{mandate_id}:{cart_id}:{amount_cents}:{currency}:{expires_at}"
-        expected_sig = hmac.new(
+    def sign(self, mandate: dict[str, Any]) -> str:
+        """Returns the HMAC-SHA256 signature over every field but ``signature``."""
+        return hmac.new(
             self.secret_key.encode("utf-8"),
-            canonical.encode("utf-8"),
+            canonical_bytes(mandate),
             hashlib.sha256,
         ).hexdigest()
 
-        return hmac.compare_digest(provided_sig, expected_sig)
+    def verify_mandate(self, mandate: dict[str, Any]) -> bool:
+        """Verifies a mandate's signature and expiry. Any tampered field fails."""
+        if int(mandate.get("expires_at", 0) or 0) < int(time.time()):
+            return False
+        provided = str(mandate.get("signature", ""))
+        if not provided:
+            return False
+        return hmac.compare_digest(self.sign(mandate), provided)
 
     def format_mandate_display(self, mandate: dict[str, Any]) -> str:
         """Renders an AP2 mandate as markdown for the user chat UI."""
@@ -104,3 +114,14 @@ class AP2Engine:
             f"}}\n"
             "```\n"
         )
+
+
+def canonical_bytes(mandate: dict[str, Any]) -> bytes:
+    """Serializes a mandate to reproducible bytes, excluding its own signature."""
+    payload = {k: v for k, v in mandate.items() if k != "signature"}
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _strict() -> bool:
+    """Whether placeholder credentials are a hard error rather than a dev convenience."""
+    return os.getenv("AC_PAYMENTS_STRICT", "") == "1"

@@ -43,9 +43,11 @@ with `checkout_cart` or generate an AP2 mandate with `generate_ap2_mandate`.
 6. Price Negotiation (A2A): If the shopper says a price is too high, asks for a discount, or gives a
 budget under the listed price, call `negotiate_price`. A buyer agent negotiates with the merchant's
 sales agent and never exceeds the stated budget. Report the agreed price and the saving.
-7. Payment: Call `process_test_payment` to capture payment for an authorized cart or mandate. This
-is always test-mode (Razorpay, else Stripe, else a simulated gateway) — say so plainly, and never
-imply real money moved.
+7. Payment: A payment needs an authorization first. Call `generate_ap2_mandate`, then
+`process_test_payment`, which charges against that mandate — it refuses without one, refuses a
+second charge on the same mandate, and refuses anything the mandate does not cover. This is always
+test-mode (Razorpay, else Stripe, else a simulated gateway) — say so plainly, and never imply real
+money moved.
 8. Multi-turn Continuity: Always remember previously discussed items, active carts, and preferences.
 
 You coordinate a crew: you talk to the shopper while specialist agents (CatalogScout, WebScout,
@@ -128,6 +130,10 @@ class CommerceAgent:
     """Orchestrates LLM reasoning, continuous conversation memory, and UCP tool execution."""
 
     DEFAULT_MODEL = os.getenv("MODEL") or "gemini-2.5-flash"
+    #: Hard cap (seconds) on a single Gemini streaming call. Without this, a stalled
+    #: response hangs execute_stream — and every layer above it — forever instead of
+    #: raising into the existing except/fallback path below.
+    LLM_TIMEOUT_SECONDS = 30.0
 
     def __init__(
         self,
@@ -244,7 +250,7 @@ class CommerceAgent:
                 with trace_llm_call(
                     self.model_name or "gemini-2.5-flash", self.temperature, self.session_id
                 ) as llm_span:
-                    for chunk in self.llm.stream(messages):
+                    for chunk in self.llm.stream(messages, timeout=self.LLM_TIMEOUT_SECONDS):
                         ai_msg = chunk if ai_msg is None else ai_msg + chunk
                         delta = extract_text_content(chunk.content)
                         if delta:
@@ -313,7 +319,7 @@ class CommerceAgent:
                         self.model_name or "gemini-2.5-flash", self.temperature, self.session_id
                     ) as synth_span:
                         synth_msg = None
-                        for chunk in self.llm.stream(messages):
+                        for chunk in self.llm.stream(messages, timeout=self.LLM_TIMEOUT_SECONDS):
                             synth_msg = chunk if synth_msg is None else synth_msg + chunk
                             delta = extract_text_content(chunk.content)
                             if delta:
