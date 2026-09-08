@@ -1,10 +1,10 @@
 # Keep the image lean and secret-free: runtime config comes from compose env_file.
-src\agentic_commerce\ui
-src\agentic_commerce\ui\__init__.py
-src\agentic_commerce\ui\app.py
-src\agentic_commerce\ui\cards.py
-src\agentic_commerce\ui\chat_engine.py
-src\agentic_commerce\ui\theme.py
+src/agentic_commerce/ui
+src/agentic_commerce/ui/__init__.py
+src/agentic_commerce/ui/app.py
+src/agentic_commerce/ui/cards.py
+src/agentic_commerce/ui/chat_engine.py
+src/agentic_commerce/ui/theme.py
 .venv/
 __pycache__/
 *.pyc
