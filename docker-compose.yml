@@ -35,6 +35,7 @@ services:
       # mandates are worthless if the record dies with the container.
       - AC_PAYMENTS_DB=/data/payments.db
       - RAZORPAY_MCP_BRIDGE=1
+      - AC_SESSION_PERSIST=1
     volumes:
       - session-data:/data
     healthcheck:
