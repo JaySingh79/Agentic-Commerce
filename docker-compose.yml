@@ -45,30 +45,30 @@ services:
       start_period: 60s
 
   # LEGACY (retained, not served): Gradio UI kept for reference only.
-  ui:
-    build: .
-    container_name: agentic-commerce-ui
-    command: ["python", "app.py"]
-    ports:
-      - "7860:7860"
-    env_file:
-      - .env
-    environment:
-      - HOST=0.0.0.0
-      - PORT=7860
-      - AC_SESSION_DB=/data/sessions.db
-      # The payment ledger shares the session volume: idempotency and single-use
-      # mandates are worthless if the record dies with the container.
-      - AC_PAYMENTS_DB=/data/payments.db
-      - RAZORPAY_MCP_BRIDGE=1
-    volumes:
-      - session-data:/data
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:7860/')"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 90s
+#   ui:
+#     build: .
+#     container_name: agentic-commerce-ui
+#     command: ["python", "app.py"]
+#     ports:
+#       - "7860:7860"
+#     env_file:
+#       - .env
+#     environment:
+#       - HOST=0.0.0.0
+#       - PORT=7860
+#       - AC_SESSION_DB=/data/sessions.db
+#       # The payment ledger shares the session volume: idempotency and single-use
+#       # mandates are worthless if the record dies with the container.
+#       - AC_PAYMENTS_DB=/data/payments.db
+#       - RAZORPAY_MCP_BRIDGE=1
+#     volumes:
+#       - session-data:/data
+#     healthcheck:
+#       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:7860/')"]
+#       interval: 30s
+#       timeout: 10s
+#       retries: 3
+#       start_period: 90s
 
-volumes:
-  session-data:
+# volumes:
+#   session-data:

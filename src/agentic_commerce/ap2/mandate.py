@@ -36,6 +36,15 @@ class MandateConfigurationError(RuntimeError):
     """Raised when the engine is asked to sign with an unusable key."""
 
 
+class MandateAmountError(ValueError):
+    """Raised when asked to mint a mandate for a non-positive amount.
+
+    A signed mandate authorizing $0 (or less) is not a smaller authorization —
+    it is a validly-signed, presentable payment ticket for nothing, which is
+    worse than no ticket at all.
+    """
+
+
 class AP2Engine:
     """Generates, signs, and validates Agent Payment Protocol (AP2) payment mandates."""
 
@@ -57,6 +66,12 @@ class AP2Engine:
         buyer_id: str = "user_default",
     ) -> dict[str, Any]:
         """Creates a signed, verifiable AP2 Payment Authorization Mandate."""
+        if amount_cents <= 0:
+            raise MandateAmountError(
+                f"Refusing to mint a mandate for a non-positive amount "
+                f"({amount_cents} cents); the cart this mandate covers must have a "
+                f"real, positive total."
+            )
         now = int(time.time())
         mandate_id = f"ap2_mandate_{uuid.uuid4().hex[:16]}"
         expires_at = now + max_duration_seconds

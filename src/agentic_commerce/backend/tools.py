@@ -305,31 +305,55 @@ def make_commerce_tools(session_id: str = DEFAULT_SESSION_ID) -> list[BaseTool]:
     ) -> str:
         """Generate an Agent Payment Protocol (AP2) verifiable payment authorization mandate.
 
+        The mandate always authorizes the session's real active cart — its id and total
+        are read from there, not from the arguments below, so a confused amount or cart id
+        can never mint a mandate that doesn't match what is actually in the cart.
+
         Args:
-            cart_id: The active Cart ID.
-            amount_cents: The exact amount in minor units (cents, e.g. 2400 for $24.00).
+            cart_id: The active Cart ID (informational; the real active cart is used).
+            amount_cents: The believed amount in minor units (informational; the cart's
+                own total is authoritative).
             currency: The 3-letter currency code (default: 'USD').
             merchant_domain: The merchant domain receiving the payment.
         """
+        session = _session()
+        active_cart = session.active_cart
+        if not active_cart:
+            return (
+                "Cannot generate a mandate: there is no active cart in this session. "
+                "Add an item to the cart with `add_to_cart` first."
+            )
+        real_cart_id = active_cart.get("id", "")
+        totals = active_cart.get("totals", [])
+        real_amount_cents = next(
+            (t.get("amount", 0) for t in totals if t.get("type") == "total"), 0
+        )
+        mismatch_note = ""
+        if cart_id and real_cart_id and cart_id != real_cart_id:
+            mismatch_note = (
+                f"\n\n*(Note: you referenced cart `{cart_id}`, but the mandate below "
+                f"is for the session's actual active cart, `{real_cart_id}`.)*"
+            )
+
         try:
             with trace_tool_execution(
                 "generate_ap2_mandate",
                 {
-                    "cart_id": cart_id,
-                    "amount_cents": amount_cents,
+                    "cart_id": real_cart_id,
+                    "amount_cents": real_amount_cents,
                     "currency": currency,
                     "merchant_domain": merchant_domain,
                 },
                 session_id=session_id,
             ):
                 mandate = _ap2_engine.create_payment_mandate(
-                    cart_id=cart_id,
-                    amount_cents=amount_cents,
+                    cart_id=real_cart_id,
+                    amount_cents=real_amount_cents,
                     currency=currency,
                     merchant_domain=merchant_domain,
                 )
-                _session().update_mandate(mandate)
-                return _ap2_engine.format_mandate_display(mandate)
+                session.update_mandate(mandate)
+                return _ap2_engine.format_mandate_display(mandate) + mismatch_note
         except Exception as e:
             return f"AP2 mandate generation error: {e}"
 

@@ -55,6 +55,14 @@ def test_tools_registry_contains_ucp_and_ap2():
 
 
 def test_ap2_tool_invocation():
+    # The mandate always authorizes the session's real active cart, not whatever
+    # the caller claims — so the tool needs one seeded first.
+    session = get_or_create_session()
+    session.update_cart({
+        "id": "gid://shopify/Cart/test_cart_999",
+        "totals": [{"type": "total", "amount": 12900}],
+    })
+
     result = generate_ap2_mandate.invoke({
         "cart_id": "gid://shopify/Cart/test_cart_999",
         "amount_cents": 12900,
@@ -63,6 +71,19 @@ def test_ap2_tool_invocation():
     })
     assert "$129.00" in result
     assert "brand.myshopify.com" in result
+
+
+def test_ap2_tool_refuses_without_an_active_cart():
+    session = get_or_create_session()
+    session.active_cart = None
+
+    result = generate_ap2_mandate.invoke({
+        "cart_id": "gid://shopify/Cart/test_cart_999",
+        "amount_cents": 12900,
+        "currency": "USD",
+        "merchant_domain": "brand.myshopify.com",
+    })
+    assert "no active cart" in result
 
 
 def test_commerce_agent_stream_execution():

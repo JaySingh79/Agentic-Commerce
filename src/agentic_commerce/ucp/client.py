@@ -258,7 +258,18 @@ class ShopifyUcpClient:
         if "error" in data:
             raise RuntimeError(f"Cart MCP Error: {data['error']}")
         structured = data.get("result", {}).get("structuredContent", {})
-        return structured.get("cart") or structured
+        cart = structured.get("cart") or structured
+        if not cart.get("id"):
+            # No "error" key, but no cart id either: the guessed/discovered endpoint
+            # answered with something that isn't a real cart (e.g. a merchant whose
+            # Storefront doesn't implement Cart MCP at all). Reporting this as a
+            # $0/"Unknown" cart "created successfully" is the honesty violation this
+            # guards against — surface it as the failure it is instead.
+            raise RuntimeError(
+                f"Cart MCP at {mcp_endpoint} did not return a cart id for "
+                f"{merchant_domain} — it may not implement create_cart."
+            )
+        return cart
 
     async def get_cart(self, merchant_domain: str, cart_id: str) -> dict[str, Any]:
         """Refreshes an existing cart's totals and availability (get_cart)."""
@@ -273,7 +284,13 @@ class ShopifyUcpClient:
         if "error" in data:
             raise RuntimeError(f"Cart MCP Error: {data['error']}")
         structured = data.get("result", {}).get("structuredContent", {})
-        return structured.get("cart") or structured
+        cart = structured.get("cart") or structured
+        if not cart.get("id"):
+            raise RuntimeError(
+                f"Cart MCP at {mcp_endpoint} did not return a cart id for "
+                f"{merchant_domain}/{cart_id}."
+            )
+        return cart
 
     async def update_cart(
         self,
