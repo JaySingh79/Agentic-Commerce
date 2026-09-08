@@ -24,7 +24,7 @@ RUN uv sync --locked --no-dev --no-install-project
 
 COPY --chown=appuser:appuser src ./src
 COPY --chown=appuser:appuser web ./web
-COPY --chown=appuser:appuser app.py openapi.json ./
+COPY --chown=appuser:appuser openapi.json ./
 RUN uv sync --locked --no-dev && rm -rf /root/.cache
 
 # Writable homes/dirs for the non-root runtime user.

@@ -52,6 +52,7 @@ pnpm-lock.yaml
 *~
 .DS_Store
 Thumbs.db
+app.py
 
 # Project specific ignores (watcher + tool caches)
 .agents/
@@ -62,6 +63,12 @@ Thumbs.db
 .playwright-mcp/
 skills/
 agents/
+src\agentic_commerce\ui
+src\agentic_commerce\ui\__init__.py
+src\agentic_commerce\ui\app.py
+src\agentic_commerce\ui\cards.py
+src\agentic_commerce\ui\chat_engine.py
+src\agentic_commerce\ui\theme.py
 
 # Keep watcher parity
 coverage/
