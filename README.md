@@ -7,6 +7,8 @@ and the vanilla-JS storefront it serves (Gradio is legacy, retained but not serv
 
 **Entrances:** vanilla-JS storefront + HTTP API on `http://localhost:8010` (served by the same FastAPI process; Gradio chat on `http://localhost:7860` is legacy).
 
+![Agentic Commerce System Architecture](1000243013.png)
+
 ---
 
 ## Table of contents
