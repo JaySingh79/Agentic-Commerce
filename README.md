@@ -5,7 +5,7 @@ Shopify's **Universal Commerce Protocol (UCP)**, A2A buyer/merchant negotiation,
 AP2 payment mandates, and test-mode payment capture — behind one typed HTTP API
 and the vanilla-JS storefront it serves (Gradio is legacy, retained but not served).
 
-**Entrances:** vanilla-JS storefront + HTTP API on `http://localhost:8010` (served by the same FastAPI process; Gradio chat on `http://localhost:7860` is legacy).
+**Live Demo:** [https://agentic-commerce-233934596124.asia-south1.run.app/](https://agentic-commerce-233934596124.asia-south1.run.app/)
 
 ![Agentic Commerce System Architecture](1000243013.png)
 
