@@ -43,6 +43,11 @@ logger = logging.getLogger(__name__)
 _FALLBACK_ORDER = ("razorpay", "stripe", "simulated")
 
 
+def _short_reason(settings: PaymentSettings, exc: Exception) -> str:
+    """One-line redacted provider failure for receipts and logs."""
+    return settings.redact(str(exc))[:200]
+
+
 def _candidates(settings: PaymentSettings) -> list[str]:
     """Providers worth trying, most preferred first, given the configuration."""
     start = _FALLBACK_ORDER.index(settings.provider)
@@ -79,8 +84,11 @@ async def process_payment(
 
     stored = book.stored_result(key)
     if stored is not None:
-        logger.info("payment %s replayed from ledger (%s)", key, stored.state)
-        return stored
+        if stored.state == PaymentState.FAILED.value and book.reopen_untransmitted(key):
+            logger.info("payment %s: prior attempt never transmitted; retrying fresh", key)
+        else:
+            logger.info("payment %s replayed from ledger (%s)", key, stored.state)
+            return stored
 
     attempt, created = book.open_attempt(
         key,
@@ -93,6 +101,7 @@ async def process_payment(
     if not created and attempt["state"] == PaymentState.UNKNOWN.value:
         return await _reconcile(settings, key, amount_cents, currency, book)
 
+    skipped: list[dict[str, str]] = []
     for name in _candidates(settings):
         provider = build_provider(name, settings)
         try:
@@ -113,10 +122,16 @@ async def process_payment(
                 raise
             # Nothing was transmitted: this provider is unusable, the next may not be.
             logger.warning("payment %s: %s unusable (%s)", key, name, exc)
+            skipped.append(
+                {"provider": name, "outcome": f"unusable: {_short_reason(settings, exc)}"}
+            )
             continue
         except ProviderRejectedError as exc:
             # The provider answered "no", so no order exists on its side.
             logger.warning("payment %s: %s refused (%s)", key, name, exc)
+            skipped.append(
+                {"provider": name, "outcome": f"refused: {_short_reason(settings, exc)}"}
+            )
             continue
         except ProviderUnknownError as exc:
             logger.error("payment %s: %s outcome unknown (%s)", key, name, exc)
@@ -124,6 +139,10 @@ async def process_payment(
 
         result.idempotency_key = key
         result.mandate_id = mandate_id or None
+        if skipped:
+            # The receipt names every provider passed over, so a simulated success
+            # with Razorpay configured reads as fallback — never as "no credentials".
+            result.raw["providers_attempted"] = skipped
         book.advance(key, PaymentState.AUTHORIZED, result)
         return result
 
@@ -184,7 +203,14 @@ def _unknown_result(
         amount_cents=amount_cents,
         currency=currency,
         live=settings.derive_live(),
-        raw={"receipt": key, "note": "provider did not answer; awaiting reconciliation"},
+        raw={
+            "receipt": key,
+            "note": (
+                "provider did not answer; awaiting reconciliation. Resolve via "
+                f"GET /api/payments/{key} or the provider webhook; to pay, mint a "
+                "fresh mandate — the presented mandate stays single-use."
+            ),
+        },
         state=PaymentState.UNKNOWN.value,
         idempotency_key=key,
     )
@@ -211,6 +237,6 @@ def _simulate(amount_cents: int, currency: str, receipt: str) -> PaymentResult:
         amount_cents=amount_cents,
         currency=currency,
         live=False,
-        raw={"receipt": receipt, "note": "no payment credentials configured"},
+        raw={"receipt": receipt, "note": "test-mode authorization recorded locally"},
         idempotency_key=receipt,
     )

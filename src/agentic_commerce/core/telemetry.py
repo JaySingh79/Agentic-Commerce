@@ -298,6 +298,26 @@ def trace_tool_execution(
         span.end()
 
 
+# Durable-snapshot write failures per session. Kept outside `_LATEST_SESSION_STATS`
+# (whose shape the UI consumes) so a disk-full turn is observable without
+# changing the stats payload — the snapshot itself carries `durable`.
+_SESSION_SAVE_FAILURES: dict[str, int] = {}
+_SESSION_SAVE_LAST_ERROR: dict[str, str] = {}
+
+
+def record_session_save_failure(session_id: str, error: str) -> None:
+    """Counts a snapshot write that never reached the durable store."""
+    _SESSION_SAVE_FAILURES[session_id] = _SESSION_SAVE_FAILURES.get(session_id, 0) + 1
+    _SESSION_SAVE_LAST_ERROR[session_id] = error
+    if _TOOL_COUNTER is not None:
+        _TOOL_COUNTER.add(1, {"tool_name": "session_save", "status": "error"})
+
+
+def get_session_save_failures(session_id: str = "default_user_session") -> int:
+    """How many snapshot writes have failed for this session this process."""
+    return _SESSION_SAVE_FAILURES.get(session_id, 0)
+
+
 def get_latest_session_stats(session_id: str = "default_user_session") -> dict[str, Any]:
     """Returns the latest captured telemetry statistics for the given session."""
     return _LATEST_SESSION_STATS.get(

@@ -39,7 +39,7 @@ class SimulatedProvider:
             amount_cents=amount_cents,
             currency=currency,
             live=False,
-            raw={"receipt": receipt, "note": "no payment credentials configured"},
+            raw={"receipt": receipt, "note": "test-mode authorization recorded locally"},
             state=PaymentState.AUTHORIZED.value,
             idempotency_key=receipt,
         )

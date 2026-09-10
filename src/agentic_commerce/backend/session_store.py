@@ -77,8 +77,33 @@ class SqliteSessionStore:
         try:
             payload = json.loads(row[0])
         except (TypeError, ValueError):
+            # A poisoned row must not brick the session forever: quarantine the
+            # blob for forensics, drop the row so the id can start fresh, and
+            # report absence. The caller mints a blank session as before.
+            self._quarantine(session_id, row[0])
             return None
         return payload if isinstance(payload, dict) else None
+
+    def _quarantine(self, session_id: str, blob: object) -> None:
+        """Moves an unparseable snapshot aside and forgets its row."""
+        try:
+            import time
+
+            safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in session_id)[:64]
+            directory = self.path.parent / "corrupt"
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / f"{safe or 'session'}.{int(time.time())}.json").write_text(
+                blob if isinstance(blob, str) else str(blob), encoding="utf-8"
+            )
+            with self._lock:
+                self._connection.execute(
+                    "DELETE FROM sessions WHERE session_id = ?", (session_id,)
+                )
+                self._connection.commit()
+        except Exception as exc:  # noqa: BLE001 - quarantine is best effort
+            import sys
+
+            print(f"[session_store] quarantine failed for {session_id}: {exc}", file=sys.stderr)
 
     def save(self, session_id: str, payload: dict[str, Any]) -> None:
         """Writes a snapshot, replacing any previous one for this id."""

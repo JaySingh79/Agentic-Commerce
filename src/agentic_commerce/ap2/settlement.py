@@ -39,6 +39,11 @@ class MockSettlementGateway:
             raise SettlementError("Mandate verification failed; refusing to settle.")
 
         mandate_id = str(mandate.get("mandate_id") or "")
+        if not get_ledger().is_mandate_claimed(mandate_id, purpose="authorization"):
+            raise SettlementError(
+                "Mandate was never authorized through the payment flow; "
+                "refusing to settle a charge that was never attempted."
+            )
         settlement_id = f"stl_{uuid.uuid4().hex[:16]}"
         try:
             get_ledger().claim_mandate(mandate_id, settlement_id, purpose="settlement")

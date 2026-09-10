@@ -67,9 +67,30 @@ class PaymentFlow:
         """The ledger this flow records into (process-wide unless injected)."""
         return self._ledger or get_ledger()
 
-    def idempotency_key(self, mandate: dict[str, Any], session_id: str = "") -> str:
-        """The key that makes a retried authorization a no-op rather than a second one."""
-        return f"{session_id}:{mandate.get('mandate_id', '')}:{mandate.get('amount_cents', 0)}"
+    def idempotency_key(
+        self,
+        mandate: dict[str, Any],
+        session_id: str = "",
+        amount_cents: int | None = None,
+        currency: str | None = None,
+    ) -> str:
+        """The key that makes a retried authorization a no-op rather than a second one.
+
+        Every signed authorization dimension is in the key: two charges that differ
+        in amount, currency, merchant, or cart are different spends even when they
+        share a session, and can never replay each other's receipts.
+        """
+        amount = amount_cents if amount_cents is not None else mandate.get("amount_cents", 0)
+        return ":".join(
+            [
+                str(session_id),
+                str(mandate.get("mandate_id", "")),
+                str(amount),
+                str(currency or mandate.get("currency", "")).upper(),
+                str(mandate.get("merchant_domain", "")),
+                str(mandate.get("cart_id", "")),
+            ]
+        )
 
     def check_mandate(
         self,
@@ -137,7 +158,7 @@ class PaymentFlow:
             expected_merchant=expected_merchant,
         )
         mandate_id = str(mandate.get("mandate_id") or "")
-        key = self.idempotency_key(mandate, session_id)
+        key = self.idempotency_key(mandate, session_id, amount, charge_currency)
 
         # Claiming before charging means a duplicated request is refused by the database,
         # not by whichever coroutine happens to check first.

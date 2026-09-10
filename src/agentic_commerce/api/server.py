@@ -16,6 +16,7 @@ which owns its own background event loop, so nothing here competes with uvicorn'
 from __future__ import annotations
 
 import json
+import queue
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -34,6 +35,7 @@ from agentic_commerce.backend.crew import CommerceCrew
 from agentic_commerce.backend.payments import process_payment, select_provider
 from agentic_commerce.backend.session import (
     DEFAULT_SESSION_ID,
+    CommerceSession,
     get_or_create_session,
     new_session_id,
 )
@@ -51,10 +53,14 @@ from agentic_commerce.payments.flow import (
     MandateTamperedError,
     authorize_payment,
 )
-from agentic_commerce.ucp.client import ShopifyUcpClient
 from agentic_commerce.payments.ledger import MandateAlreadyUsedError, get_ledger
-from agentic_commerce.payments.providers.razorpay import verify_webhook_signature
+from agentic_commerce.payments.models import PaymentResult, PaymentState
+from agentic_commerce.payments.providers.razorpay import (
+    short_receipt,
+    verify_webhook_signature,
+)
 from agentic_commerce.payments.settings import PaymentSettings
+from agentic_commerce.ucp.client import ShopifyUcpClient
 
 WEB_ROOT = Path(__file__).resolve().parents[3] / "web"
 
@@ -233,22 +239,36 @@ def session_snapshot(session_id: str) -> dict[str, Any]:
         "active_payment": session.active_payment,
         "best_pick": session.best_pick,
         "crew_events": session.last_crew_events,
+        "durable": session.last_save_ok,
+        "durability_error": session.last_save_error or None,
     }
+
+
+def _drain_turn_queue(
+    session: CommerceSession, turn_queue: queue.Queue[dict[str, Any]]
+) -> Iterator[str]:
+    """Forwards crew records written since the last drain, in write order."""
+    while True:
+        try:
+            record = turn_queue.get_nowait()
+        except queue.Empty:
+            return
+        yield _sse({"type": "crew", **record})
 
 
 def _stream_turn(request: ChatRequest, session_id: str) -> Iterator[str]:
     """Adapts the agent's event generator to SSE frames.
 
     Crew events recorded during the turn are replayed as `crew` events so the client
-    can render which specialists ran, how long each took, and which failed — data the
-    crew produces today and the Gradio UI discards.
+    can render which specialists ran, how long they took, and which failed.
 
-    Only events produced *by this turn* are forwarded. The session still holds the
-    previous turn's list, and `update_crew_events` replaces that list wholesale
-    rather than appending, so progress is tracked by the list's identity plus an
-    index: a new list means a fresh discovery run and the index restarts. Counting
-    alone replayed the last search's scouts onto an unrelated question, complete
-    with timings longer than the turn itself.
+    Each turn subscribes a private outbox on the session
+    (`CommerceSession.subscribe_turn_events`); tools fan every crew record out to
+    all live outboxes as they write it, and this loop drains its own outbox after
+    every agent event. Only events produced *while this turn runs* are forwarded,
+    so a stale search's scouts can never replay onto an unrelated question — and
+    concurrent turns on one session can no longer duplicate or drop each other's
+    specialists through the old shared list-identity + index bookkeeping.
     """
     agent = CommerceAgent(
         session_id=session_id,
@@ -256,8 +276,7 @@ def _stream_turn(request: ChatRequest, session_id: str) -> Iterator[str]:
         temperature=request.temperature,
     )
     session = get_or_create_session(session_id)
-    tracked_events = session.last_crew_events
-    seen_events = len(tracked_events)
+    turn_queue = session.subscribe_turn_events()
     # Identity, not equality: a mandate re-issued for the same cart and amount is a
     # different authorization and deserves its own ticket in the transcript.
     last_mandate = session.active_mandate
@@ -265,38 +284,33 @@ def _stream_turn(request: ChatRequest, session_id: str) -> Iterator[str]:
     started = time.perf_counter()
 
     try:
-        kwargs: dict[str, Any] = {"message": request.message, "history": request.history}
-        if request.system_prompt:
-            kwargs["system_prompt"] = request.system_prompt
+        try:
+            kwargs: dict[str, Any] = {"message": request.message, "history": request.history}
+            if request.system_prompt:
+                kwargs["system_prompt"] = request.system_prompt
 
-        for event in agent.execute_stream(**kwargs):
-            yield _sse(event)
+            for event in agent.execute_stream(**kwargs):
+                yield _sse(event)
+                yield from _drain_turn_queue(session, turn_queue)
 
-            # The crew writes its events into the session as tools run; forward any
-            # that appeared since the last check.
-            events = session.last_crew_events
-            if events is not tracked_events:
-                tracked_events = events
-                seen_events = 0
-            if len(events) > seen_events:
-                for record in events[seen_events:]:
-                    yield _sse({"type": "crew", **record})
-                seen_events = len(events)
-
-            # Mandates and receipts are the two things in a turn worth keeping as an
-            # object rather than a sentence, so they are emitted as artifacts the
-            # client can render inline and act on.
-            if session.active_mandate is not last_mandate:
-                last_mandate = session.active_mandate
-                if last_mandate:
-                    yield _sse({"type": "artifact", "kind": "mandate", "data": last_mandate})
-            if session.active_payment is not last_payment:
-                last_payment = session.active_payment
-                if last_payment:
-                    yield _sse({"type": "artifact", "kind": "payment", "data": last_payment})
-    except Exception as exc:  # noqa: BLE001 - a stream must end with a reportable event
-        yield _sse({"type": "error", "error": "turn_failed", "message": str(exc)})
-        return
+                # Mandates and receipts are the two things in a turn worth keeping as an
+                # object rather than a sentence, so they are emitted as artifacts the
+                # client can render inline and act on.
+                if session.active_mandate is not last_mandate:
+                    last_mandate = session.active_mandate
+                    if last_mandate:
+                        yield _sse({"type": "artifact", "kind": "mandate", "data": last_mandate})
+                if session.active_payment is not last_payment:
+                    last_payment = session.active_payment
+                    if last_payment:
+                        yield _sse({"type": "artifact", "kind": "payment", "data": last_payment})
+            yield from _drain_turn_queue(session, turn_queue)
+        except Exception as exc:  # noqa: BLE001 - a stream must end with a reportable event
+            yield from _drain_turn_queue(session, turn_queue)
+            yield _sse({"type": "error", "error": "turn_failed", "message": str(exc)})
+            return
+    finally:
+        session.unsubscribe_turn_events(turn_queue)
 
     yield _sse(
         {
@@ -304,6 +318,7 @@ def _stream_turn(request: ChatRequest, session_id: str) -> Iterator[str]:
             "session_id": session_id,
             "elapsed": round(time.perf_counter() - started, 3),
             "stats": get_latest_session_stats(session_id),
+            "durable": session.last_save_ok,
         }
     )
 
@@ -734,6 +749,55 @@ def create_app(serve_frontend: bool = True) -> FastAPI:
             "result": attempt["result"],
         }
 
+    def _resolve_unknown_from_webhook(
+        payload: dict[str, Any], settings: PaymentSettings
+    ) -> str | None:
+        """Closes an UNKNOWN attempt the provider just confirmed as paid.
+
+        Razorpay echoes our idempotency key back as the order `receipt`, so an
+        `order.paid` delivery can only complete the one attempt it names — never
+        a retry elsewhere. Anything unrecognized (or an attempt that is not
+        UNKNOWN) resolves nothing; the webhook is still acknowledged so the
+        provider does not retry a delivery we cannot use. Best effort by design:
+        resolution must never turn an ack into a 500 retry storm.
+        """
+        try:
+            if payload.get("event") != "order.paid":
+                return None
+            entity = payload.get("payload", {}).get("order", {}).get("entity", {})
+            wire_receipt = str(entity.get("receipt") or "")
+            if not wire_receipt:
+                return None
+            book = get_ledger()
+            # The wire receipt may be the hashed form of a long ledger key
+            # (see `short_receipt`): match it back to the one UNKNOWN attempt.
+            receipt = None
+            for key in book.unknown_keys():
+                if key == wire_receipt or short_receipt(key) == wire_receipt:
+                    receipt = key
+                    break
+            if receipt is None:
+                return None
+            attempt = book.get(receipt)
+            if attempt is None or attempt.get("state") != PaymentState.UNKNOWN.value:
+                return None
+            result = PaymentResult(
+                provider="razorpay",
+                status="captured",
+                reference_id=str(entity.get("id") or ""),
+                amount_cents=int(entity.get("amount") or attempt.get("amount_cents", 0)),
+                currency=str(entity.get("currency") or attempt.get("currency", "INR")),
+                live=settings.derive_live(),
+                raw={"webhook_event": "order.paid"},
+                state=PaymentState.AUTHORIZED.value,
+                idempotency_key=receipt,
+                mandate_id=attempt.get("mandate_id") or None,
+            )
+            book.advance(receipt, PaymentState.AUTHORIZED, result)
+            return receipt
+        except Exception:  # noqa: BLE001 - resolution is best effort; the ack stands
+            return None
+
     @app.post("/api/payments/webhook/razorpay")
     async def razorpay_webhook(http_request: Request) -> dict[str, Any]:
         """Accepts a Razorpay webhook after verifying it against the raw body.
@@ -770,7 +834,13 @@ def create_app(serve_frontend: bool = True) -> FastAPI:
             raise HTTPException(status_code=400, detail="webhook carries no event id")
 
         fresh = get_ledger().record_event(event_id, "razorpay", payload)
-        return {"received": True, "event_id": event_id, "duplicate": not fresh}
+        resolved = _resolve_unknown_from_webhook(payload, settings)
+        return {
+            "received": True,
+            "event_id": event_id,
+            "duplicate": not fresh,
+            "resolved": resolved,
+        }
 
     @app.get("/api/telemetry/{session_id}")
     def get_telemetry(session_id: str) -> dict[str, Any]:
@@ -801,8 +871,10 @@ def main() -> None:
         host=os.getenv("HOST", "127.0.0.1"),
         port=int(os.getenv("API_PORT", "8010")),
         log_level="info",
+        debug=True
     )
 
 
 if __name__ == "__main__":
     main()
+    

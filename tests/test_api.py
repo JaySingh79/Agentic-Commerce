@@ -514,7 +514,12 @@ def test_webhook_signature_is_verified_over_the_raw_body(
         headers={"X-Razorpay-Signature": signature, "content-type": "application/json"},
     )
     assert good.status_code == 200
-    assert good.json() == {"received": True, "event_id": "evt_1", "duplicate": False}
+    assert good.json() == {
+        "received": True,
+        "event_id": "evt_1",
+        "duplicate": False,
+        "resolved": None,
+    }
 
     replay = client.post(
         "/api/payments/webhook/razorpay",

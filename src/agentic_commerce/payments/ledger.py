@@ -236,7 +236,9 @@ class PaymentLedger:
                 if existing["idempotency_key"] == idempotency_key:
                     return
                 raise MandateAlreadyUsedError(
-                    f"mandate {mandate_id!r} has already been claimed for {purpose}"
+                    f"mandate {mandate_id!r} has already been claimed for {purpose} "
+                    f"(see attempt {existing['idempotency_key']!r}); mint a fresh "
+                    "mandate to pay again"
                 )
             self._connection.execute(
                 "INSERT INTO mandate_claims "
@@ -244,6 +246,58 @@ class PaymentLedger:
                 (mandate_id, purpose, idempotency_key, time.time()),
             )
             self._connection.commit()
+
+    def is_mandate_claimed(self, mandate_id: str, purpose: str = "authorization") -> bool:
+        """Whether a mandate already carries a claim for `purpose`.
+
+        Settlement consults this so a mandate can never settle without first
+        being authorized through the guarded flow — signature validity alone is
+        not proof that a charge was attempted.
+        """
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT 1 FROM mandate_claims WHERE mandate_id = ? AND purpose = ?",
+                (mandate_id, purpose),
+            ).fetchone()
+        return row is not None
+
+    def reopen_untransmitted(self, idempotency_key: str) -> bool:
+        """Forgets a FAILED attempt that never reached a provider, allowing retry.
+
+        Returns True when the row was reopened. Only attempts with an empty
+        `reference_id` qualify: anything transmitted might have created an order
+        on the far side, and retrying under the same key could duplicate it.
+        Terminal FAILED rows with a reference stay put.
+        """
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT state, reference_id FROM payment_attempts WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if row is None:
+                return False
+            if row["state"] != PaymentState.FAILED.value or row["reference_id"]:
+                return False
+            self._connection.execute(
+                "DELETE FROM payment_attempts WHERE idempotency_key = ?",
+                (idempotency_key,),
+            )
+            self._connection.commit()
+        return True
+
+    def unknown_keys(self) -> list[str]:
+        """Idempotency keys of attempts still awaiting reconciliation.
+
+        Used by the webhook resolver to match a provider receipt back to the one
+        attempt it can legally complete. UNKNOWN rows are rare, so a scan needs
+        no new index or schema change.
+        """
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT idempotency_key FROM payment_attempts WHERE state = ?",
+                (PaymentState.UNKNOWN.value,),
+            ).fetchall()
+        return [row["idempotency_key"] for row in rows]
 
     # -- webhooks ---------------------------------------------------------
 

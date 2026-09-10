@@ -85,3 +85,5 @@ logs.txt
 skills-lock.json
 logs
 opencode.json
+# Playwright CLI output (may contain credentials)
+.playwright-cli/

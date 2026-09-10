@@ -13,12 +13,16 @@ construction. Mandates live for an hour, so no migration path is needed for the 
 scheme — ``ap2_version`` is bumped and the old format simply stops verifying.
 """
 
+import contextlib
 import hashlib
 import hmac
 import json
+import logging
 import os
+import secrets
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 # Status literals kept as module constants; also mirrored by core.models.MandateStatus.
@@ -27,9 +31,51 @@ STATUS_PENDING = "AUTHORIZED_PENDING_SETTLEMENT"
 #: Bumped when the signing scheme changed from a 5-field string to canonical JSON.
 AP2_VERSION = "2026-09-01"
 
-#: The placeholder key the engine used when nothing was configured. Signing real
-#: authorizations with a constant published in this repository is not a signature.
-_INSECURE_DEFAULT_SECRET = "ap2_default_secret_key"
+logger = logging.getLogger(__name__)
+
+#: Cached unconfigured-deployment secret for this process.
+_DEV_SECRET_CACHE: str | None = None
+
+
+def _dev_secret() -> str:
+    """Returns a random signing secret for deployments without `CLIENT_SECRET`.
+
+    The secret is generated once and persisted to `.agentic_commerce/ap2_secret.key`
+    (override with `AC_AP2_SECRET_FILE`) so mandates keep verifying across
+    restarts. Unlike the old published constant, it cannot be forged from the
+    repository. Under pytest no file is touched: the suite must not leave files
+    behind, and one process is enough for its mandates to verify.
+    """
+    global _DEV_SECRET_CACHE
+    if _DEV_SECRET_CACHE:
+        return _DEV_SECRET_CACHE
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        _DEV_SECRET_CACHE = secrets.token_hex(32)
+        return _DEV_SECRET_CACHE
+
+    override = os.getenv("AC_AP2_SECRET_FILE", "").strip()
+    path = Path(override) if override else Path.cwd() / ".agentic_commerce" / "ap2_secret.key"
+    try:
+        existing = path.read_text(encoding="utf-8").strip()
+        if existing:
+            _DEV_SECRET_CACHE = existing
+            return existing
+    except OSError:
+        pass
+    generated = secrets.token_hex(32)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(generated + "\n", encoding="utf-8")
+        with contextlib.suppress(OSError):
+            os.chmod(path, 0o600)
+    except OSError as exc:
+        logger.warning("AP2 dev secret is memory-only this run: %s", exc)
+    _DEV_SECRET_CACHE = generated
+    logger.warning(
+        "No CLIENT_SECRET configured: signing AP2 mandates with a local dev secret. "
+        "Set CLIENT_SECRET for anything shared."
+    )
+    return generated
 
 
 class MandateConfigurationError(RuntimeError):
@@ -49,12 +95,15 @@ class AP2Engine:
     """Generates, signs, and validates Agent Payment Protocol (AP2) payment mandates."""
 
     def __init__(self, secret_key: str | None = None):
-        self.secret_key = secret_key or os.getenv("CLIENT_SECRET") or _INSECURE_DEFAULT_SECRET
-        if self.secret_key == _INSECURE_DEFAULT_SECRET and _strict():
+        if secret_key or os.getenv("CLIENT_SECRET"):
+            self.secret_key = secret_key or os.getenv("CLIENT_SECRET", "")
+        elif _strict():
             raise MandateConfigurationError(
                 "AC_PAYMENTS_STRICT is set but no CLIENT_SECRET is configured; "
-                "refusing to sign mandates with the built-in placeholder key."
+                "refusing to sign mandates without an explicit key."
             )
+        else:
+            self.secret_key = _dev_secret()
 
     def create_payment_mandate(
         self,

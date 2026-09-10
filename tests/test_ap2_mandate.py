@@ -22,15 +22,33 @@ def test_mandate_lifecycle_and_tamper():
 
 
 def test_settlement_capture_marks_settled_and_ledgers():
+    from agentic_commerce.payments.ledger import get_ledger
+
     engine = AP2Engine(secret_key="test_secret_123")
     gateway = MockSettlementGateway(engine)
     mandate = engine.create_payment_mandate(cart_id="gid://shopify/Cart/1", amount_cents=2400)
+    get_ledger().claim_mandate(mandate["mandate_id"], "key-auth-1")
 
     receipt = gateway.capture(mandate)
     assert receipt["status"] == MandateStatus.SETTLED.value
     assert receipt["amount_cents"] == 2400
     assert receipt["settlement_id"].startswith("stl_")
     assert len(gateway.get_ledger()) == 1
+
+
+def test_settlement_refuses_a_mandate_that_was_never_authorized():
+    """Contract: signature validity is not proof of charge; settle needs a prior
+    authorization claim, otherwise a receipt could exist for money never attempted."""
+    from agentic_commerce.payments.ledger import get_ledger
+
+    engine = AP2Engine(secret_key="test_secret_123")
+    gateway = MockSettlementGateway(engine)
+    mandate = engine.create_payment_mandate(cart_id="gid://shopify/Cart/1", amount_cents=2400)
+    assert not get_ledger().is_mandate_claimed(mandate["mandate_id"])
+
+    with pytest.raises(SettlementError, match="never authorized"):
+        gateway.capture(mandate)
+    assert gateway.get_ledger() == []
 
 
 def test_settlement_rejects_tampered_mandate():
@@ -86,9 +104,12 @@ def test_strict_mode_refuses_the_placeholder_signing_key(monkeypatch):
 
 
 def test_a_mandate_settles_only_once():
+    from agentic_commerce.payments.ledger import get_ledger
+
     engine = AP2Engine(secret_key="test_secret_123")
     gateway = MockSettlementGateway(engine)
     mandate = engine.create_payment_mandate(cart_id="gid://shopify/Cart/1", amount_cents=2400)
+    get_ledger().claim_mandate(mandate["mandate_id"], "key-auth-2")
 
     gateway.capture(mandate)
     with pytest.raises(SettlementError, match="already"):

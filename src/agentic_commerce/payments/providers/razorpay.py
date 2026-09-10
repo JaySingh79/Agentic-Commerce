@@ -24,6 +24,19 @@ from agentic_commerce.payments.settings import PaymentSettings
 
 ORDERS_URL = "https://api.razorpay.com/v1/orders"
 
+#: Razorpay caps the order `receipt` field (40 chars). Ledger idempotency keys
+#: are longer (`session:mandate:amount:currency:merchant:cart`), so long keys
+#: are hashed — deterministically, so create, find-by-receipt, and the webhook
+#: resolver all agree on the wire value while the ledger keeps the full key.
+_RAZORPAY_RECEIPT_LIMIT = 40
+
+
+def short_receipt(receipt: str) -> str:
+    """Maps a ledger idempotency key onto a Razorpay-legal receipt value."""
+    if len(receipt) <= _RAZORPAY_RECEIPT_LIMIT:
+        return receipt
+    return "ac_" + hashlib.sha256(receipt.encode()).hexdigest()[:32]
+
 
 class RazorpayProvider:
     """Creates and reads Razorpay orders under test credentials."""
@@ -48,7 +61,7 @@ class RazorpayProvider:
         payload = {
             "amount": amount_cents,
             "currency": currency,
-            "receipt": receipt,
+            "receipt": short_receipt(receipt),
             "notes": {"source": "agentic_commerce", "flow": "ap2_mandate"},
         }
         try:
@@ -87,7 +100,7 @@ class RazorpayProvider:
         try:
             async with httpx.AsyncClient(timeout=self.settings.timeout) as client:
                 res = await client.get(
-                    ORDERS_URL, auth=self._auth(), params={"receipt": receipt}
+                    ORDERS_URL, auth=self._auth(), params={"receipt": short_receipt(receipt)}
                 )
         except httpx.HTTPError as exc:
             raise classify_transport_error(exc) from exc

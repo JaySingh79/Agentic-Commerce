@@ -1,6 +1,8 @@
 """Session state and conversation history management for continuous multi-turn commerce."""
 
+import queue
 import secrets
+import threading
 from contextvars import ContextVar
 from dataclasses import dataclass, field, fields
 from typing import Any
@@ -32,6 +34,19 @@ class CommerceSession:
     best_pick: dict[str, Any] | None = None
     last_crew_events: list[dict[str, Any]] = field(default_factory=list)
     session_id: str = DEFAULT_SESSION_ID
+    #: Whether the latest snapshot write reached the durable store. Surfaced in
+    #: `session_snapshot()` and the SSE `done` frame so the UI can warn instead
+    #: of silently losing the cart on restart.
+    last_save_ok: bool = True
+    #: The latest snapshot-write error, empty when the last save succeeded.
+    last_save_error: str = ""
+
+    def __post_init__(self) -> None:
+        # Transient per-turn fan-out, deliberately *not* dataclass fields so
+        # they never enter snapshots: each live `_stream_turn` subscribes its
+        # own queue and receives exactly the crew events written while it runs.
+        self._turn_lock = threading.Lock()
+        self._turn_queues: list[queue.Queue[dict[str, Any]]] = []
 
     def to_dict(self) -> dict[str, Any]:
         """Serializable snapshot of every field, for the durable store."""
@@ -43,19 +58,37 @@ class CommerceSession:
         known = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in payload.items() if k in known})
 
-    def save(self) -> None:
+    def save(self) -> bool:
         """Persists the session so a refresh or restart does not lose the cart.
 
         Storage failures are reported and swallowed *here only*: a snapshot write is
         a side effect of a commerce action, and failing the shopper's add-to-cart
-        because the disk is full would be worse than losing durability.
+        because the disk is full would be worse than losing durability. The outcome
+        is recorded on `last_save_ok` / `last_save_error` (and a telemetry counter)
+        so callers and the UI can observe the degradation instead of guessing.
+        Returns True when the snapshot reached the store.
         """
         try:
             get_store().save(self.session_id, self.to_dict())
         except Exception as exc:  # noqa: BLE001 - see docstring
             import sys
 
-            print(f"[session] snapshot not saved for {self.session_id}: {exc}", file=sys.stderr)
+            self.last_save_ok = False
+            self.last_save_error = str(exc)[:300]
+            try:
+                from agentic_commerce.core.telemetry import record_session_save_failure
+
+                record_session_save_failure(self.session_id, self.last_save_error)
+            except Exception:  # noqa: BLE001 - observability must not break the turn
+                pass
+            print(
+                f"[session] snapshot not saved for {self.session_id}: {exc}",
+                file=sys.stderr,
+            )
+            return False
+        self.last_save_ok = True
+        self.last_save_error = ""
+        return True
 
     def add_message(self, role: str, content: str) -> None:
         """Appends a message to the session history."""
@@ -92,14 +125,46 @@ class CommerceSession:
         self.best_pick = best_pick
         self.save()
 
+    def subscribe_turn_events(self) -> queue.Queue[dict[str, Any]]:
+        """Registers a per-turn outbox receiving crew events written while live.
+
+        Each SSE turn owns its queue, so concurrent turns on one session can no
+        longer duplicate or drop each other's specialists via the old shared
+        list-identity + index bookkeeping. Remember to `unsubscribe_turn_events`.
+        """
+        outbox: queue.Queue[dict[str, Any]] = queue.Queue()
+        with self._turn_lock:
+            self._turn_queues.append(outbox)
+        return outbox
+
+    def unsubscribe_turn_events(self, outbox: queue.Queue[dict[str, Any]]) -> None:
+        """Detaches a per-turn outbox; undelivered records are discarded."""
+        with self._turn_lock:
+            if outbox in self._turn_queues:
+                self._turn_queues.remove(outbox)
+
+    def push_crew_event(self, record: dict[str, Any]) -> None:
+        """Fans one crew record out to every live turn outbox (best effort)."""
+        with self._turn_lock:
+            outboxes = list(self._turn_queues)
+        for outbox in outboxes:
+            outbox.put(record)
+
     def update_crew_events(self, events: list[dict[str, Any]]) -> None:
         """Stores the specialists' progress reports for the agent-activity surface.
 
         Without this the crew's own record of who ran, how long they took, and who
         failed is produced and then discarded, leaving the UI unable to tell an empty
         result from a broken provider.
+
+        The stored list keeps replace semantics (latest discovery run wins, so a
+        stale search's scouts never linger), while every record is *also* pushed to
+        live per-turn outboxes — so a second search in one turn no longer hides the
+        first search's trail from the stream that is currently running.
         """
         self.last_crew_events = events
+        for record in events:
+            self.push_crew_event(record)
         self.save()
 
     def clear_search_results(self) -> None:

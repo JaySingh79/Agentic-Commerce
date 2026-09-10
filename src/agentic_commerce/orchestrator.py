@@ -22,7 +22,7 @@ from agentic_commerce.core.models import (
 )
 from agentic_commerce.core.runtime import run_async
 from agentic_commerce.payments.flow import authorize_payment
-from agentic_commerce.payments.models import PaymentResult
+from agentic_commerce.payments.models import PaymentError, PaymentResult, PaymentState
 from agentic_commerce.ucp.cart import _to_cart
 from agentic_commerce.ucp.client import ShopifyUcpClient, default_client
 
@@ -127,9 +127,19 @@ class CommerceOrchestrator:
             amount_cents = self.negotiate(products[0])
 
         mandate = self.authorize_payment(cart, amount_cents=amount_cents, buyer_id=buyer_id)
+        print(f"Mandate: {mandate}")
         payment = self.charge(mandate, cart, session_id=buyer_id)
+        print(f"Payment result: {payment}")
+        if payment.state != PaymentState.AUTHORIZED.value:
+            raise PaymentError(
+                f"cannot settle a payment in state {payment.state!r}; resolve it via "
+                f"GET /api/payments/{payment.idempotency_key} or the provider webhook "
+                "before placing the order"
+            )
         receipt = self.settle(mandate)
+        print(f"Settlement receipt: {receipt}")
         order = self.place_order(cart, receipt)
+        print(f"Order: {order}")
 
         return {
             "products": products,
