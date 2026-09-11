@@ -871,7 +871,6 @@ def main() -> None:
         host=os.getenv("HOST", "127.0.0.1"),
         port=int(os.getenv("API_PORT", "8010")),
         log_level="info",
-        debug=True
     )
 
 
